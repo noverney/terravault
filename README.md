@@ -24,6 +24,32 @@ TerraVault is a lightweight Python toolkit that connects to any STAC-compliant c
 
 ## Installation
 
+### Install from this repository (recommended for local use)
+
+```bash
+cd /path/to/terravault
+conda activate terra
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+Install with extras:
+
+```bash
+python -m pip install -e ".[raster]"    # adds rasterio
+python -m pip install -e ".[postgres]"  # adds psycopg2-binary
+python -m pip install -e ".[dev]"       # adds pytest + responses for development
+```
+
+Verify the install:
+
+```bash
+terravault --help
+python -c "import terravault; print(terravault.__version__)"
+```
+
+### Install from PyPI
+
 ```bash
 pip install terravault
 ```
