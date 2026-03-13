@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# TerraVault local retrieval example outputs
+examples/switzerland_patch/data/*
+!examples/switzerland_patch/data/.gitkeep

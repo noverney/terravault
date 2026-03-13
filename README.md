@@ -96,6 +96,21 @@ print(f"Failed     : {result.downloads_failed}")
 result = Pipeline(cfg).run(download=False)
 ```
 
+### Small Switzerland patch test script
+
+For a ready-to-run retrieval test over a small Switzerland AOI (Zurich area),
+use:
+
+```bash
+python examples/switzerland_patch/retrieve_patch.py
+```
+
+Outputs are saved under:
+
+```text
+examples/switzerland_patch/data/
+```
+
 ---
 
 ## Command-line interface
