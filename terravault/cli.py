@@ -599,9 +599,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch_p.add_argument(
         "--asset-profile",
-        choices=("native", "metadata-only"),
+        choices=("native", "ndvi", "metadata-only"),
         default="native",
-        help="native downloads canonical best-resolution L2A layers (default: native)",
+        help=(
+            "native downloads all canonical L2A layers; ndvi downloads B04, B08, "
+            "SCL and CLD (default: native)"
+        ),
     )
     watch_p.add_argument(
         "--asset-keys",
@@ -787,9 +790,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     historic_p.add_argument(
         "--asset-profile",
-        choices=("native", "metadata-only"),
+        choices=("native", "ndvi", "metadata-only"),
         default="native",
-        help="Complete best/native-resolution L2A profile (default: native)",
+        help=(
+            "native downloads the complete L2A profile; ndvi downloads B04, B08, "
+            "SCL and CLD (default: native)"
+        ),
     )
     historic_p.add_argument(
         "--asset-keys",

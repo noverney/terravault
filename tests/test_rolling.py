@@ -9,7 +9,13 @@ from pathlib import Path
 import pystac
 import pytest
 
-from terravault.rolling import RunLock, RollingConfig, RollingIngestor, load_roi
+from terravault.rolling import (
+    NDVI_L2A_ASSET_KEYS,
+    RunLock,
+    RollingConfig,
+    RollingIngestor,
+    load_roi,
+)
 from terravault.s3_downloader import S3DownloadResult
 from terravault.spatial import geometry_area
 
@@ -89,6 +95,21 @@ def test_load_bbox_and_geojson_roi(tmp_path):
 
     with pytest.raises(ValueError, match="exactly one"):
         load_roi()
+
+
+def test_ndvi_profile_is_minimal_and_includes_quality_masks():
+    config = RollingConfig(
+        roi=load_roi(bbox=[5.96, 45.82, 10.49, 47.81]),
+        asset_profile="ndvi",
+    )
+
+    assert config.requested_asset_keys == NDVI_L2A_ASSET_KEYS
+    assert config.requested_asset_keys == (
+        "B04_10m",
+        "B08_10m",
+        "SCL_20m",
+        "CLD_20m",
+    )
 
 
 def test_metadata_only_run_is_idempotent_and_writes_status(tmp_path):

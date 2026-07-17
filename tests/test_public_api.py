@@ -17,3 +17,14 @@ def test_historical_imports_are_public():
     assert HistoricalConfig is not None
     assert HistoricalIngestor is not None
     assert HistoricalRunResult is not None
+
+
+def test_ndvi_profile_is_public():
+    from terravault import NDVI_L2A_ASSET_KEYS
+
+    assert NDVI_L2A_ASSET_KEYS == (
+        "B04_10m",
+        "B08_10m",
+        "SCL_20m",
+        "CLD_20m",
+    )

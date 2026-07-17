@@ -26,6 +26,7 @@ CDSE note: there is no generic static "API key" for these workflows. CDSE produc
 | **Operational logs** | Automatic rotating progress, storage, retry, quota and completion logs |
 | **Explicit ROI** | Rolling discovery accepts a WGS84 bbox or Polygon/MultiPolygon GeoJSON |
 | **Historical backfill** | Windowed progress, durable cursor, quota waits and retired jobs |
+| **Compact NDVI profile** | Native 10 m B04/B08 plus SCL/CLD masks via `--asset-profile ndvi` |
 | **CLI** | One-shot, rolling, historical, metadata-query and stitched-extraction commands |
 
 ---

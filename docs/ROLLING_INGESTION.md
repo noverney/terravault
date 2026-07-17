@@ -114,6 +114,18 @@ terravault watch \
   --asset-keys B02_10m B03_10m B04_10m SCL_20m
 ```
 
+For the compact standard-NDVI profile (10 m red/NIR plus 20 m SCL/CLD masks):
+
+```bash
+terravault watch \
+  --bbox 5.96 45.82 10.49 47.81 \
+  --asset-profile ndvi \
+  --storage-root satellite_data/switzerland_ndvi
+```
+
+See [`SWITZERLAND_NDVI.md`](SWITZERLAND_NDVI.md) for the live transfer-size
+estimate, masking notes, queries and extraction command.
+
 To validate discovery/state without S3 credentials or raster downloads:
 
 ```bash

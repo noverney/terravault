@@ -9,6 +9,7 @@ __all__ = [
     "HistoricalConfig",
     "HistoricalIngestor",
     "HistoricalRunResult",
+    "NDVI_L2A_ASSET_KEYS",
     "AssetDownloader",
     "Pipeline",
     "PipelineConfig",
@@ -93,10 +94,23 @@ def __getattr__(name: str):
         from .process_api import ProcessPatchConfig
 
         return ProcessPatchConfig
-    if name in {"RegionOfInterest", "RollingConfig", "RollingIngestor", "load_roi"}:
-        from .rolling import RegionOfInterest, RollingConfig, RollingIngestor, load_roi
+    if name in {
+        "NDVI_L2A_ASSET_KEYS",
+        "RegionOfInterest",
+        "RollingConfig",
+        "RollingIngestor",
+        "load_roi",
+    }:
+        from .rolling import (
+            NDVI_L2A_ASSET_KEYS,
+            RegionOfInterest,
+            RollingConfig,
+            RollingIngestor,
+            load_roi,
+        )
 
         return {
+            "NDVI_L2A_ASSET_KEYS": NDVI_L2A_ASSET_KEYS,
             "RegionOfInterest": RegionOfInterest,
             "RollingConfig": RollingConfig,
             "RollingIngestor": RollingIngestor,

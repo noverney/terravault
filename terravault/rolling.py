@@ -60,6 +60,15 @@ NATIVE_L2A_ASSET_KEYS: tuple[str, ...] = (
     "inspire_metadata",
 )
 
+# Compact analysis-ready profile for standard NDVI.  B04 and B08 are the
+# native 10 m red/NIR inputs; SCL and CLD support invalid/cloud masking.
+NDVI_L2A_ASSET_KEYS: tuple[str, ...] = (
+    "B04_10m",
+    "B08_10m",
+    "SCL_20m",
+    "CLD_20m",
+)
+
 _SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
 _MIN_BOOTSTRAP_FOOTPRINT_RATIO = 0.9
 
@@ -119,8 +128,10 @@ class RollingConfig:
             or self.quota_retry_seconds < 0
         ):
             raise ValueError("retry delays cannot be negative")
-        if self.asset_profile not in {"native", "metadata-only", "custom"}:
-            raise ValueError("asset_profile must be native, metadata-only or custom")
+        if self.asset_profile not in {"native", "ndvi", "metadata-only", "custom"}:
+            raise ValueError(
+                "asset_profile must be native, ndvi, metadata-only or custom"
+            )
         if self.asset_profile == "custom" and not self.asset_keys:
             raise ValueError("custom asset profile requires at least one --asset-key")
         if self.asset_profile != "custom" and self.asset_keys:
@@ -132,6 +143,8 @@ class RollingConfig:
             return ()
         if self.asset_profile == "custom":
             return tuple(dict.fromkeys(self.asset_keys))
+        if self.asset_profile == "ndvi":
+            return NDVI_L2A_ASSET_KEYS
         return NATIVE_L2A_ASSET_KEYS
 
     @property

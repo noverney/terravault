@@ -127,6 +127,22 @@ def test_parse_dates_and_minimal_cli():
     assert args.window_days == 1
     assert args.max_attempts == 8
 
+    ndvi_args = build_parser().parse_args(
+        [
+            "historic",
+            "--bbox",
+            "5.96",
+            "45.82",
+            "10.49",
+            "47.81",
+            "--start-date",
+            "2024-01-01",
+            "--asset-profile",
+            "ndvi",
+        ]
+    )
+    assert ndvi_args.asset_profile == "ndvi"
+
 
 def test_historical_windows_resume_from_durable_cursor(tmp_path):
     items = [
