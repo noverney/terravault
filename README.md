@@ -4,7 +4,10 @@
 
 TerraVault is a lightweight Python toolkit that connects to any STAC-compliant catalog, discovers new satellite scenes for a configurable area of interest, persists their metadata locally, and downloads the assets you need — all while keeping track of what has already been ingested so each run processes only *new* data.
 
-CDSE note: there is no generic static "API key" for these workflows. CDSE product download uses an access token derived from your account login, while Sentinel Hub patch extraction uses an OAuth client ID/secret that you create in the CDSE dashboard.
+CDSE note: there is no single interchangeable "API key" for these workflows.
+Native product ingestion uses S3 access/secret keys, while Sentinel Hub
+processing uses an OAuth client ID/secret to obtain short-lived API access
+tokens. See [Copernicus credentials](#copernicus-credentials) below.
 
 ---
 
@@ -74,6 +77,55 @@ pip install "terravault[s3]"        # adds boto3 for native rolling ingestion
 pip install "terravault[postgres]"  # adds psycopg2-binary
 pip install "terravault[dev]"       # adds pytest + responses for development
 ```
+
+---
+
+## Copernicus credentials
+
+TerraVault supports two separate Copernicus Data Space Ecosystem (CDSE)
+access routes. Create the credential that matches the command you intend to
+run; the two credential pairs are not interchangeable.
+
+| Credential | Create it here | Used for |
+|---|---|---|
+| **S3 access key + secret key** | [CDSE S3 Credentials Manager](https://eodata-s3keysmanager.dataspace.copernicus.eu/panel/s3-credentials) | `terravault watch` and `terravault historic`; downloads original native-resolution Sentinel files into the local partitioned dataset |
+| **Sentinel Hub OAuth client ID + client secret** | [CDSE Dashboard → User Settings → OAuth clients](https://shapps.dataspace.copernicus.eu/dashboard/#/account/settings) | Process API examples such as `fetch_raw_patch.py` and `fetch_switzerland_snapshot.py`; requests server-side subsets, reprojection, mosaicking or derived products |
+
+For native S3 ingestion, sign in to the S3 Credentials Manager, choose
+**Add Credentials**, select an expiry date and save both values in `.env`:
+
+```dotenv
+TERRAVAULT_CDSE_S3_ACCESS_KEY=your_s3_access_key
+TERRAVAULT_CDSE_S3_SECRET_KEY=your_s3_secret_key
+TERRAVAULT_CDSE_S3_ENDPOINT=https://eodata.dataspace.copernicus.eu
+TERRAVAULT_CDSE_S3_REGION=default
+```
+
+For Sentinel Hub processing, open the account settings page, create an OAuth
+client and save its client ID and secret in `.env`:
+
+```dotenv
+TERRAVAULT_CDSE_SH_CLIENT_ID=your_sentinel_hub_oauth_client_id
+TERRAVAULT_CDSE_SH_CLIENT_SECRET=your_sentinel_hub_oauth_client_secret
+```
+
+Both portals display a newly created secret only once. Copy it immediately,
+keep `.env` private and never commit real credentials. TerraVault exchanges
+the Sentinel Hub client credentials for a short-lived bearer access token
+automatically; do not paste that bearer token into the S3 fields.
+
+Neither credential is intrinsically faster because it selects a different
+data path:
+
+- S3 is normally the appropriate high-throughput route for rolling or
+  historical downloads of complete, original products and native bands.
+- Sentinel Hub can be quicker and transfer much less data for a small area,
+  a few bands or a server-computed result, but processing-unit quotas apply.
+
+The official references are the
+[CDSE S3 access guide](https://documentation.dataspace.copernicus.eu/APIs/S3.html)
+and
+[Sentinel Hub authentication guide](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Overview/Authentication.html).
 
 ---
 
