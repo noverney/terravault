@@ -8,14 +8,16 @@ Creates and manages the following directory structure::
                 MM/
                     DD/
                         TILE_ID/
-                            scene_metadata.json
-                            *.tif
+                            ITEM_ID/
+                                scene_metadata.json
+                                *.tif
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,14 @@ import pystac
 logger = logging.getLogger(__name__)
 
 DEFAULT_ROOT = Path("satellite_data")
+_MGRS_FROM_ITEM_ID_RE = re.compile(r"_T(?P<tile>\d{2}[A-Z]{3})(?:_|$)")
+
+
+def _safe_path_component(value: str) -> str:
+    """Return *value* with path separators and unsafe characters replaced."""
+
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
+    return cleaned or "unknown"
 
 
 def _tile_id_from_item(item: pystac.Item) -> str:
@@ -49,8 +59,20 @@ def _tile_id_from_item(item: pystac.Item) -> str:
     if utm and lat and grid:
         return f"{utm}{lat}{grid}"
 
+    # CDSE Sentinel-2 STAC items currently encode MGRS in the item ID even
+    # when the corresponding property is absent.
+    match = _MGRS_FROM_ITEM_ID_RE.search(item.id)
+    if match:
+        return match.group("tile")
+
     # Use the plain item ID as a safe fallback
     return item.id
+
+
+def tile_id_from_item(item: pystac.Item) -> str:
+    """Return the best available MGRS tile identifier for a STAC item."""
+
+    return _tile_id_from_item(item)
 
 
 def _item_date(item: pystac.Item) -> datetime:
@@ -86,9 +108,11 @@ class StorageManager:
         self,
         root: str | Path = DEFAULT_ROOT,
         mission: str = "sentinel2",
+        hive_partitions: bool = False,
     ) -> None:
         self.root = Path(root)
         self.mission = mission
+        self.hive_partitions = hive_partitions
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -97,15 +121,29 @@ class StorageManager:
     def scene_dir(self, item: pystac.Item) -> Path:
         """Return (and create) the directory for a particular scene."""
         dt = _item_date(item)
-        tile = _tile_id_from_item(item)
-        path = (
-            self.root
-            / self.mission
-            / f"{dt.year:04d}"
-            / f"{dt.month:02d}"
-            / f"{dt.day:02d}"
-            / tile
-        )
+        tile = _safe_path_component(_tile_id_from_item(item))
+        item_id = _safe_path_component(item.id)
+        if self.hive_partitions:
+            path = (
+                self.root
+                / "pieces"
+                / f"collection={_safe_path_component(self.mission)}"
+                / f"year={dt.year:04d}"
+                / f"month={dt.month:02d}"
+                / f"day={dt.day:02d}"
+                / f"tile={tile}"
+                / f"item={item_id}"
+            )
+        else:
+            path = (
+                self.root
+                / self.mission
+                / f"{dt.year:04d}"
+                / f"{dt.month:02d}"
+                / f"{dt.day:02d}"
+                / tile
+                / item_id
+            )
         path.mkdir(parents=True, exist_ok=True)
         return path
 

@@ -15,12 +15,12 @@ Orchestrates the full workflow:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 import pystac
 
+from .auth import CDSEDownloadAuthConfig, build_cdse_session_factory
 from .catalog import CatalogClient, DEFAULT_COLLECTIONS, SWITZERLAND_BBOX
 from .downloader import AssetDownloader, DownloadConfig, DownloadResult
 from .state import StateManager, SQLiteStateManager
@@ -53,10 +53,16 @@ class PipelineConfig:
         How many hours back to search when there is no recorded state.
         On subsequent runs the pipeline uses the last-processed timestamp
         from the state store instead.
+    resume_overlap_hours:
+        Overlap applied when resuming from state. Re-querying a recent window
+        protects against catalogue publication delays; item-ID deduplication
+        makes the overlap idempotent.
     download:
         Download tuning parameters.
     asset_keys:
         Asset keys to download.  Empty list means *all* assets.
+    auth:
+        Optional CDSE authentication for asset downloads.
     state_db:
         Path to the SQLite state database.
     storage_root:
@@ -68,8 +74,10 @@ class PipelineConfig:
     bbox: list[float] = field(default_factory=lambda: list(SWITZERLAND_BBOX))
     max_cloud_cover: float | None = 20.0
     lookback_hours: int = _DEFAULT_LOOKBACK_HOURS
+    resume_overlap_hours: int = _DEFAULT_LOOKBACK_HOURS
     download: DownloadConfig = field(default_factory=DownloadConfig)
     asset_keys: list[str] = field(default_factory=list)
+    auth: CDSEDownloadAuthConfig | None = None
     state_db: str = "terravault_state.db"
     storage_root: str = "satellite_data"
 
@@ -132,9 +140,15 @@ class Pipeline:
             max_cloud_cover=self.config.max_cloud_cover,
         )
         self._storage = StorageManager(root=self.config.storage_root)
-        dl_config = self.config.download
-        dl_config.asset_keys = self.config.asset_keys
-        self._downloader = AssetDownloader(storage=self._storage, config=dl_config)
+        dl_config = replace(self.config.download, asset_keys=list(self.config.asset_keys))
+        session_factory = None
+        if self.config.auth is not None:
+            session_factory = build_cdse_session_factory(self.config.auth)
+        self._downloader = AssetDownloader(
+            storage=self._storage,
+            config=dl_config,
+            session_factory=session_factory,
+        )
         self._state: StateManager = SQLiteStateManager(self.config.state_db)
 
     # ------------------------------------------------------------------
@@ -146,8 +160,13 @@ class Pipeline:
         end = datetime.now(tz=timezone.utc)
         last = self._state.last_processed
         if last is not None:
-            start = last
-            logger.info("Resuming from last processed timestamp: %s", start.isoformat())
+            start = last - timedelta(hours=self.config.resume_overlap_hours)
+            logger.info(
+                "Resuming from %s with a %d-hour overlap: %s",
+                last.isoformat(),
+                self.config.resume_overlap_hours,
+                start.isoformat(),
+            )
         else:
             start = end - timedelta(hours=self.config.lookback_hours)
             logger.info(
@@ -201,25 +220,33 @@ class Pipeline:
 
         new_items: list[pystac.Item] = []
 
-        for item in self._catalog.search(start_datetime=start, end_datetime=end):
-            result.items_discovered += 1
+        try:
+            for item in self._catalog.search(start_datetime=start, end_datetime=end):
+                result.items_discovered += 1
 
-            if self._state.is_ingested(item.id):
-                logger.debug("Skipping already-ingested item %s", item.id)
-                result.items_skipped_duplicate += 1
-                continue
+                if self._state.is_ingested(item.id):
+                    logger.debug("Skipping already-ingested item %s", item.id)
+                    result.items_skipped_duplicate += 1
+                    continue
 
-            # Persist metadata
-            try:
-                self._storage.save_metadata(item)
-            except Exception as exc:  # noqa: BLE001
-                msg = f"Failed to save metadata for {item.id}: {exc}"
-                logger.error(msg)
-                result.errors.append(msg)
-                continue
+                # Persist metadata
+                try:
+                    self._storage.save_metadata(item)
+                except Exception as exc:  # noqa: BLE001
+                    msg = f"Failed to save metadata for {item.id}: {exc}"
+                    logger.error(msg)
+                    result.errors.append(msg)
+                    continue
 
-            new_items.append(item)
-            result.items_processed += 1
+                new_items.append(item)
+                result.items_processed += 1
+        except Exception as exc:  # noqa: BLE001
+            msg = f"Catalog search failed: {exc}"
+            logger.error(msg)
+            result.errors.append(msg)
+            # An incomplete page must not advance state. Metadata already
+            # written during this attempt is harmless and will be refreshed.
+            return result
 
         logger.info(
             "Discovery complete – %d discovered, %d new, %d duplicates",
@@ -231,8 +258,37 @@ class Pipeline:
         if download and new_items:
             result.download_results = self._downloader.download_items(new_items)
 
-        # Update state for successfully processed items
+        # Only mark an item complete when all requested downloads succeeded.
+        # Failed and missing assets must remain discoverable on the next run.
+        completed_ids = {item.id for item in new_items} if not download else set()
+        if download:
+            results_by_item: dict[str, list[DownloadResult]] = {}
+            for download_result in result.download_results:
+                results_by_item.setdefault(download_result.item_id, []).append(download_result)
+
+            for item in new_items:
+                item_results = results_by_item.get(item.id, [])
+                if not item_results:
+                    msg = f"No downloadable assets were found for {item.id}"
+                    logger.error(msg)
+                    result.errors.append(msg)
+                    continue
+                failures = [entry for entry in item_results if not entry.success]
+                if failures:
+                    for failure in failures:
+                        msg = (
+                            f"Download failed for {failure.item_id}/{failure.asset_key}: "
+                            f"{failure.error or 'unknown error'}"
+                        )
+                        logger.error(msg)
+                        result.errors.append(msg)
+                    continue
+                completed_ids.add(item.id)
+
+        # Update state for successfully completed items.
         for item in new_items:
+            if item.id not in completed_ids:
+                continue
             item_dt = self._item_datetime(item)
             try:
                 self._state.mark_processed(item.id, item_dt)

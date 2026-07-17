@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock
 
 import pystac
 
@@ -109,6 +109,69 @@ class TestPipelineRunMetadataOnly(unittest.TestCase):
 
         self.assertTrue(pipeline._state.is_ingested(item.id))
 
+    def test_failed_download_is_not_marked_ingested(self):
+        item = _make_item("item-download-failed")
+        item.assets = {"B04": MagicMock(spec=pystac.Asset)}
+
+        cfg = PipelineConfig(
+            storage_root=self.tmpdir,
+            state_db=":memory:",
+            asset_keys=["B04"],
+        )
+        pipeline = Pipeline(cfg)
+        pipeline._catalog.search = MagicMock(return_value=iter([item]))
+        pipeline._downloader.download_items = MagicMock(
+            return_value=[
+                DownloadResult(
+                    item.id,
+                    "B04",
+                    Path("B04.tif"),
+                    success=False,
+                    error="network failure",
+                )
+            ]
+        )
+
+        result = pipeline.run(download=True)
+
+        self.assertFalse(pipeline._state.is_ingested(item.id))
+        self.assertEqual(result.downloads_failed, 1)
+        self.assertTrue(result.errors)
+
+    def test_successful_download_is_marked_ingested(self):
+        item = _make_item("item-download-ok")
+        item.assets = {"B04": MagicMock(spec=pystac.Asset)}
+
+        cfg = PipelineConfig(
+            storage_root=self.tmpdir,
+            state_db=":memory:",
+            asset_keys=["B04"],
+        )
+        pipeline = Pipeline(cfg)
+        pipeline._catalog.search = MagicMock(return_value=iter([item]))
+        pipeline._downloader.download_items = MagicMock(
+            return_value=[
+                DownloadResult(item.id, "B04", Path("B04.tif"), success=True)
+            ]
+        )
+
+        pipeline.run(download=True)
+
+        self.assertTrue(pipeline._state.is_ingested(item.id))
+
+    def test_catalog_error_is_reported_without_raising(self):
+        cfg = PipelineConfig(
+            storage_root=self.tmpdir,
+            state_db=":memory:",
+        )
+        pipeline = Pipeline(cfg)
+        pipeline._catalog.search = MagicMock(side_effect=RuntimeError("catalog offline"))
+
+        result = pipeline.run(download=False)
+
+        self.assertEqual(result.items_processed, 0)
+        self.assertIn("Catalog search failed", result.errors[0])
+
 
 class TestPipelineRunResult(unittest.TestCase):
     def test_computed_properties(self):
@@ -132,6 +195,19 @@ class TestPipelineConfig(unittest.TestCase):
     def test_custom_lookback(self):
         cfg = PipelineConfig(lookback_hours=48)
         self.assertEqual(cfg.lookback_hours, 48)
+
+    def test_resume_window_includes_overlap(self):
+        cfg = PipelineConfig(
+            state_db=":memory:",
+            resume_overlap_hours=24,
+        )
+        pipeline = Pipeline(cfg)
+        last = datetime(2026, 7, 10, 12, tzinfo=timezone.utc)
+        pipeline._state.mark_processed("existing", last)
+
+        start, _ = pipeline._search_window()
+
+        self.assertEqual(start, last - timedelta(hours=24))
 
 
 if __name__ == "__main__":

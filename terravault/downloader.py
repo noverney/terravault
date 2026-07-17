@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
+from urllib.parse import urlparse
 
 import requests
 from tqdm import tqdm
@@ -167,6 +168,23 @@ class AssetDownloader:
                 error="Asset has no href",
             )
 
+        scheme = urlparse(href).scheme.lower()
+        if scheme and scheme not in {"http", "https"}:
+            if scheme == "s3":
+                error = (
+                    "S3 asset hrefs are not supported by the requests-based downloader. "
+                    "CDSE raw assets often require S3 credentials or the Sentinel Hub Process API."
+                )
+            else:
+                error = f"Unsupported asset URL scheme: {scheme}"
+            return DownloadResult(
+                item_id=item.id,
+                asset_key=asset_key,
+                local_path=Path(),
+                success=False,
+                error=error,
+            )
+
         # Determine file extension from the href or media type
         suffix = Path(href.split("?")[0]).suffix or ".tif"
         local_path = self.storage.asset_path(item, asset_key, suffix=suffix)
@@ -182,8 +200,8 @@ class AssetDownloader:
             )
 
         logger.info("Downloading %s / %s → %s", item.id, asset_key, local_path)
-        session = self._session_factory()
         try:
+            session = self._session_factory()
             self._download_url(href, local_path, session)
             return DownloadResult(
                 item_id=item.id,
@@ -199,6 +217,11 @@ class AssetDownloader:
                 success=False,
                 error=str(exc),
             )
+        finally:
+            session = locals().get("session")
+            close = getattr(session, "close", None)
+            if callable(close):
+                close()
 
     # ------------------------------------------------------------------
     # Public API
@@ -209,6 +232,23 @@ class AssetDownloader:
         if self.config.asset_keys:
             return {k: v for k, v in item.assets.items() if k in self.config.asset_keys}
         return dict(item.assets)
+
+    def _missing_asset_results(self, item: pystac.Item) -> list[DownloadResult]:
+        """Return failure results for explicitly requested keys that are absent."""
+
+        if not self.config.asset_keys:
+            return []
+        return [
+            DownloadResult(
+                item_id=item.id,
+                asset_key=key,
+                local_path=Path(),
+                success=False,
+                error=f"Requested asset key {key!r} is not present in the STAC item",
+            )
+            for key in self.config.asset_keys
+            if key not in item.assets
+        ]
 
     def download_item(self, item: pystac.Item) -> list[DownloadResult]:
         """Download all configured assets for a single STAC item.
@@ -222,7 +262,7 @@ class AssetDownloader:
             One entry per asset attempted.
         """
         assets = self._assets_to_download(item)
-        results: list[DownloadResult] = []
+        results = self._missing_asset_results(item)
         for key, asset in assets.items():
             results.append(self._download_asset(item, key, asset))
         return results
@@ -253,6 +293,7 @@ class AssetDownloader:
         # accurate progress bar and dispatch at the asset level.
         tasks: list[tuple[pystac.Item, str, pystac.Asset]] = []
         for item in item_list:
+            all_results.extend(self._missing_asset_results(item))
             for key, asset in self._assets_to_download(item).items():
                 tasks.append((item, key, asset))
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Any, Iterator
 
 import pystac
 import pystac_client
@@ -41,6 +41,9 @@ class CatalogClient:
     bbox:
         Spatial filter as ``[west, south, east, north]`` in WGS-84 decimal
         degrees.  Defaults to a bounding box covering Switzerland.
+    intersects:
+        GeoJSON geometry used as an exact STAC spatial filter.  When supplied,
+        it takes precedence over ``bbox``.
     max_cloud_cover:
         Maximum allowed ``eo:cloud_cover`` percentage (0–100).  Items above
         this threshold are excluded.  Pass ``None`` to disable the filter.
@@ -51,11 +54,13 @@ class CatalogClient:
         catalog_url: str = COPERNICUS_STAC_URL,
         collections: list[str] | None = None,
         bbox: list[float] | None = None,
+        intersects: dict[str, Any] | None = None,
         max_cloud_cover: float | None = DEFAULT_MAX_CLOUD_COVER,
     ) -> None:
         self.catalog_url = catalog_url
         self.collections = collections or DEFAULT_COLLECTIONS
-        self.bbox = bbox or SWITZERLAND_BBOX
+        self.intersects = intersects
+        self.bbox = None if intersects is not None else (bbox or SWITZERLAND_BBOX)
         self.max_cloud_cover = max_cloud_cover
 
     # ------------------------------------------------------------------
@@ -74,6 +79,8 @@ class CatalogClient:
             # Ensure UTC then strip microseconds for a clean representation.
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
             return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         return f"{_fmt(start)}/{_fmt(end)}"
@@ -82,6 +89,24 @@ class CatalogClient:
     def _cloud_cover(item: pystac.Item) -> float | None:
         """Return the ``eo:cloud_cover`` property of a STAC item, or ``None``."""
         return item.properties.get("eo:cloud_cover")
+
+    @staticmethod
+    def item_datetime(item: pystac.Item) -> datetime:
+        """Return the item's datetime, falling back to STAC properties."""
+        dt = item.datetime
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+
+        raw = item.properties.get("datetime") or item.properties.get("start_datetime")
+        if not raw:
+            raise ValueError(f"Item {item.id} has no datetime information")
+
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
     # ------------------------------------------------------------------
     # Public API
@@ -118,18 +143,26 @@ class CatalogClient:
         client = self._open_client()
 
         logger.info(
-            "Searching %s – collections=%s bbox=%s datetime=%s",
+            "Searching %s – collections=%s bbox=%s intersects=%s datetime=%s",
             self.catalog_url,
             self.collections,
             self.bbox,
+            "yes" if self.intersects is not None else "no",
             datetime_str,
         )
 
+        search_kwargs: dict[str, Any] = {
+            "collections": self.collections,
+            "datetime": datetime_str,
+            "max_items": max_items,
+        }
+        if self.intersects is not None:
+            search_kwargs["intersects"] = self.intersects
+        else:
+            search_kwargs["bbox"] = self.bbox
+
         search = client.search(
-            collections=self.collections,
-            bbox=self.bbox,
-            datetime=datetime_str,
-            max_items=max_items,
+            **search_kwargs,
         )
 
         count = 0
@@ -155,3 +188,25 @@ class CatalogClient:
         """Return the IDs of all collections exposed by the catalog."""
         client = self._open_client()
         return [c.id for c in client.get_collections()]
+
+    def latest_item(
+        self,
+        start_datetime: datetime,
+        end_datetime: datetime | None = None,
+        max_items: int | None = None,
+    ) -> pystac.Item | None:
+        """Return the newest item matching the configured filters."""
+        latest: pystac.Item | None = None
+        latest_dt: datetime | None = None
+
+        for item in self.search(
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            max_items=max_items,
+        ):
+            item_dt = self.item_datetime(item)
+            if latest_dt is None or item_dt > latest_dt:
+                latest = item
+                latest_dt = item_dt
+
+        return latest

@@ -46,6 +46,15 @@ class TestCatalogClientInit(unittest.TestCase):
         self.assertEqual(client.catalog_url, "https://example.com")
         self.assertIsNone(client.max_cloud_cover)
 
+    def test_geojson_intersects_takes_precedence_over_bbox(self):
+        geometry = {
+            "type": "Polygon",
+            "coordinates": [[[8.0, 47.0], [8.1, 47.0], [8.1, 47.1], [8.0, 47.0]]],
+        }
+        client = CatalogClient(bbox=[6, 45, 11, 48], intersects=geometry)
+        self.assertIsNone(client.bbox)
+        self.assertEqual(client.intersects, geometry)
+
 
 class TestFormatDatetimeInterval(unittest.TestCase):
     def test_utc_datetimes(self):
@@ -59,6 +68,16 @@ class TestFormatDatetimeInterval(unittest.TestCase):
         end = datetime(2024, 3, 2, 8, 0, 0)
         result = CatalogClient._format_datetime_interval(start, end)
         self.assertIn("Z", result)
+
+    def test_aware_datetimes_are_converted_to_utc(self):
+        from datetime import timedelta
+
+        plus_two = timezone(timedelta(hours=2))
+        result = CatalogClient._format_datetime_interval(
+            datetime(2024, 1, 1, 2, tzinfo=plus_two),
+            datetime(2024, 1, 2, 2, tzinfo=plus_two),
+        )
+        self.assertEqual(result, "2024-01-01T00:00:00Z/2024-01-02T00:00:00Z")
 
 
 class TestCloudCoverFilter(unittest.TestCase):
@@ -108,6 +127,54 @@ class TestCloudCoverFilter(unittest.TestCase):
     def test_empty_catalog_returns_empty(self):
         result = self._run_search([], max_cloud_cover=20.0)
         self.assertEqual(result, [])
+
+    def test_search_passes_intersects_instead_of_bbox(self):
+        geometry = {
+            "type": "Polygon",
+            "coordinates": [[[8.0, 47.0], [8.1, 47.0], [8.1, 47.1], [8.0, 47.0]]],
+        }
+        client = CatalogClient(intersects=geometry)
+        mock_search = MagicMock()
+        mock_search.items.return_value = iter([])
+        mock_stac_client = MagicMock()
+        mock_stac_client.search.return_value = mock_search
+        with patch.object(client, "_open_client", return_value=mock_stac_client):
+            list(
+                client.search(
+                    datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    datetime(2024, 1, 2, tzinfo=timezone.utc),
+                )
+            )
+        kwargs = mock_stac_client.search.call_args.kwargs
+        self.assertEqual(kwargs["intersects"], geometry)
+        self.assertNotIn("bbox", kwargs)
+
+
+class TestLatestItem(unittest.TestCase):
+    def test_returns_newest_item(self):
+        items = [
+            _make_item("older", dt=datetime(2024, 6, 1, 10, 0, 0, tzinfo=timezone.utc)),
+            _make_item("newest", dt=datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)),
+            _make_item("middle", dt=datetime(2024, 6, 1, 11, 0, 0, tzinfo=timezone.utc)),
+        ]
+        client = CatalogClient()
+        with patch.object(client, "search", return_value=iter(items)):
+            latest = client.latest_item(
+                start_datetime=datetime(2024, 6, 1, tzinfo=timezone.utc),
+                end_datetime=datetime(2024, 6, 2, tzinfo=timezone.utc),
+            )
+
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.id, "newest")
+
+    def test_item_datetime_falls_back_to_properties(self):
+        item = MagicMock(spec=pystac.Item)
+        item.id = "fallback"
+        item.datetime = None
+        item.properties = {"datetime": "2024-06-01T12:34:56Z"}
+
+        parsed = CatalogClient.item_datetime(item)
+        self.assertEqual(parsed, datetime(2024, 6, 1, 12, 34, 56, tzinfo=timezone.utc))
 
 
 if __name__ == "__main__":

@@ -5,8 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from datetime import datetime, timezone
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pystac
 import requests
@@ -76,6 +75,19 @@ class TestAssetDownloaderMissingHref(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0].success)
         self.assertIn("no href", results[0].error.lower())
+
+    def test_returns_failure_for_s3_href(self):
+        mock_asset = MagicMock(spec=pystac.Asset)
+        mock_asset.href = "s3://eodata/Sentinel-2/test.jp2"
+        item = _make_item(assets={"B04": mock_asset})
+
+        cfg = DownloadConfig(asset_keys=["B04"])
+        dl = AssetDownloader(storage=self.storage, config=cfg)
+        results = dl.download_item(item)
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertIn("s3", results[0].error.lower())
 
 
 class TestAssetDownloaderNetworkSuccess(unittest.TestCase):
@@ -162,6 +174,17 @@ class TestAssetKeyFiltering(unittest.TestCase):
         downloaded_keys = {r.asset_key for r in results}
         self.assertEqual(downloaded_keys, {"B04", "B08"})
         self.assertNotIn("B11", downloaded_keys)
+
+    def test_missing_requested_key_is_a_failure(self):
+        item = _make_item()
+        cfg = DownloadConfig(asset_keys=["does-not-exist"])
+        dl = AssetDownloader(storage=self.storage, config=cfg)
+
+        results = dl.download_item(item)
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertIn("not present", results[0].error)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -48,9 +47,17 @@ class TestTileIdExtraction(unittest.TestCase):
         self.assertEqual(_tile_id_from_item(item), "32TNT")
 
     def test_fallback_to_item_id(self):
-        item = _make_item(mgrs_tile=None)
+        item = _make_item(item_id="item-without-tile", mgrs_tile=None)
         item.properties = {}
         self.assertEqual(_tile_id_from_item(item), item.id)
+
+    def test_mgrs_tile_is_parsed_from_cdse_item_id(self):
+        item = _make_item(
+            item_id="S2A_MSIL2A_20260704T102701_N0512_R108_T32TNT_20260704T170718",
+            mgrs_tile=None,
+        )
+        item.properties = {}
+        self.assertEqual(_tile_id_from_item(item), "32TNT")
 
     def test_mgrs_components(self):
         item = _make_item(mgrs_tile=None)
@@ -84,9 +91,44 @@ class TestStorageManager(unittest.TestCase):
     def test_scene_dir_structure(self):
         item = _make_item(dt=datetime(2024, 6, 15, tzinfo=timezone.utc), mgrs_tile="32TNT")
         scene_dir = self.mgr.scene_dir(item)
-        expected = Path(self.tmpdir) / "sentinel2" / "2024" / "06" / "15" / "32TNT"
+        expected = (
+            Path(self.tmpdir)
+            / "sentinel2"
+            / "2024"
+            / "06"
+            / "15"
+            / "32TNT"
+            / item.id
+        )
         self.assertEqual(scene_dir, expected)
         self.assertTrue(scene_dir.is_dir())
+
+    def test_same_tile_and_day_gets_one_directory_per_item(self):
+        first = _make_item(item_id="scene-one")
+        second = _make_item(item_id="scene-two")
+        self.assertNotEqual(self.mgr.scene_dir(first), self.mgr.scene_dir(second))
+
+    def test_hive_partitioned_dataset_structure(self):
+        manager = StorageManager(
+            root=self.tmpdir,
+            mission="sentinel-2-l2a",
+            hive_partitions=True,
+        )
+        item = _make_item(
+            dt=datetime(2024, 6, 15, tzinfo=timezone.utc),
+            mgrs_tile="32TNT",
+        )
+        expected = (
+            Path(self.tmpdir)
+            / "pieces"
+            / "collection=sentinel-2-l2a"
+            / "year=2024"
+            / "month=06"
+            / "day=15"
+            / "tile=32TNT"
+            / f"item={item.id}"
+        )
+        self.assertEqual(manager.scene_dir(item), expected)
 
     def test_metadata_path(self):
         item = _make_item()

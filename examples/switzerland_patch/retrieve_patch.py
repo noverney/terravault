@@ -12,10 +12,11 @@ from pathlib import Path
 DEFAULT_SWISS_PATCH_BBOX = [8.47, 47.33, 8.62, 47.44]
 
 
-def _load_terravault() -> tuple[object, object, object]:
+def _load_terravault() -> tuple[object, object, object, object]:
     try:
         from terravault import Pipeline
         from terravault.downloader import DownloadConfig
+        from terravault.env import load_dotenv
         from terravault.pipeline import PipelineConfig
     except ModuleNotFoundError:
         # Allow running directly from the repository without installing first.
@@ -23,8 +24,9 @@ def _load_terravault() -> tuple[object, object, object]:
         sys.path.insert(0, str(repo_root))
         from terravault import Pipeline
         from terravault.downloader import DownloadConfig
+        from terravault.env import load_dotenv
         from terravault.pipeline import PipelineConfig
-    return Pipeline, DownloadConfig, PipelineConfig
+    return Pipeline, DownloadConfig, PipelineConfig, load_dotenv
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--catalog-url",
         default="https://stac.dataspace.copernicus.eu/v1",
         help="STAC catalog URL",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Optional .env file to load before resolving credentials",
     )
     parser.add_argument(
         "--collections",
@@ -103,7 +110,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    Pipeline, DownloadConfig, PipelineConfig = _load_terravault()
+    Pipeline, DownloadConfig, PipelineConfig, load_dotenv = _load_terravault()
+    load_dotenv(args.env_file)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
