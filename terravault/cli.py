@@ -73,6 +73,9 @@ def _default_log_file(args: argparse.Namespace) -> Path | None:
     dataset_db = getattr(args, "dataset_db", None)
     if dataset_db:
         return Path(dataset_db).parent / "_terravault" / "logs" / f"{args.command}.log"
+    output_root = getattr(args, "output_root", None)
+    if output_root:
+        return Path(output_root) / "_terravault" / "logs" / f"{args.command}.log"
     return None
 
 
@@ -406,6 +409,53 @@ def cmd_extract(args: argparse.Namespace) -> int:
         f"{result.estimated_uncompressed_bytes / (1024**3):.2f}"
         f"  manifest={result.manifest_path}"
     )
+    return 0
+
+
+def cmd_force(args: argparse.Namespace) -> int:
+    import shlex
+
+    from .force import ForceConfig, ForcePostprocessor
+
+    try:
+        result = ForcePostprocessor(
+            ForceConfig(
+                input_path=Path(args.input),
+                output_root=Path(args.output_root),
+                basename=args.basename,
+                runtime=args.runtime,
+                docker_image=args.docker_image,
+                mount_root=None if args.mount_root is None else Path(args.mount_root),
+                target_crs=args.target_crs,
+                origin_lon=args.origin_lon,
+                origin_lat=args.origin_lat,
+                tile_size=args.tile_size,
+                resolution=args.resolution,
+                resampling=args.resampling,
+                output_nodata=args.output_nodata,
+                output_dtype=args.output_dtype,
+                jobs=args.jobs,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+        ).run()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    action = "planned" if result.status == "planned" else "complete"
+    duplicate = " (already complete; skipped)" if result.skipped else ""
+    print(
+        f"FORCE postprocessing {action}{duplicate} – runtime={result.runtime}"
+        f"  cube={result.cube_root}"
+        f"  chips={len(result.chip_paths)}"
+        f"  mosaic={result.mosaic_path}"
+        f"  manifest={result.manifest_path}"
+    )
+    if result.status == "planned":
+        print("Commands:")
+        for command in result.commands:
+            print(f"  {shlex.join(command)}")
     return 0
 
 
@@ -1111,6 +1161,134 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rotating extraction log path",
     )
     extract_p.set_defaults(func=cmd_extract)
+
+    # ---------------------------------------------------------------- force
+    from .force import FORCE_DOCKER_IMAGE
+
+    force_p = sub.add_parser(
+        "force",
+        help="Import a local stitched raster into a FORCE external-feature datacube",
+    )
+    force_p.add_argument(
+        "--env-file",
+        default=".env",
+        metavar="PATH",
+        help="Optional .env file (default: .env)",
+    )
+    force_p.add_argument(
+        "--input",
+        required=True,
+        metavar="TIFF",
+        help="Local georeferenced raster with nodata defined on every band",
+    )
+    force_p.add_argument(
+        "--output-root",
+        required=True,
+        metavar="DIR",
+        help="Root for the FORCE datacube, durable job state and logs",
+    )
+    force_p.add_argument(
+        "--basename",
+        default=None,
+        metavar="NAME",
+        help="FORCE feature basename (default: sanitized input filename)",
+    )
+    force_p.add_argument(
+        "--runtime",
+        choices=("auto", "native", "docker"),
+        default="auto",
+        help="FORCE runtime; auto prefers native commands, then Docker",
+    )
+    force_p.add_argument(
+        "--docker-image",
+        default=FORCE_DOCKER_IMAGE,
+        metavar="IMAGE",
+        help=f"Pinned FORCE container image (default: {FORCE_DOCKER_IMAGE})",
+    )
+    force_p.add_argument(
+        "--mount-root",
+        default=None,
+        metavar="DIR",
+        help="Docker volume root containing both input and output",
+    )
+    force_p.add_argument(
+        "--target-crs",
+        default="EPSG:2056",
+        metavar="CRS",
+        help="FORCE datacube CRS (default: EPSG:2056)",
+    )
+    force_p.add_argument(
+        "--origin-lon",
+        type=float,
+        default=5.5,
+        metavar="DEG",
+        help="WGS84 longitude of grid origin (default: 5.5)",
+    )
+    force_p.add_argument(
+        "--origin-lat",
+        type=float,
+        default=48.0,
+        metavar="DEG",
+        help="WGS84 latitude of grid origin (default: 48.0)",
+    )
+    force_p.add_argument(
+        "--tile-size",
+        type=int,
+        default=30_000,
+        metavar="UNITS",
+        help="Square FORCE tile size in target-CRS units (default: 30000)",
+    )
+    force_p.add_argument(
+        "--resolution",
+        type=float,
+        default=10,
+        metavar="UNITS",
+        help="FORCE feature resolution in target-CRS units (default: 10)",
+    )
+    force_p.add_argument(
+        "--resampling",
+        default="near",
+        metavar="METHOD",
+        help="GDAL resampling used by force-cube (default: near)",
+    )
+    force_p.add_argument(
+        "--output-nodata",
+        type=int,
+        default=-9999,
+        metavar="VALUE",
+        help="Nodata written to FORCE feature chips (default: -9999)",
+    )
+    force_p.add_argument(
+        "--output-dtype",
+        choices=("Byte", "Int16"),
+        default="Int16",
+        metavar="TYPE",
+        help="FORCE-compatible feature type (default: Int16)",
+    )
+    force_p.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Parallel FORCE cube/mosaic jobs (default: 1)",
+    )
+    force_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate input and print the FORCE commands without running them",
+    )
+    force_p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace chips for an existing basename",
+    )
+    force_p.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Rotating log path (default: OUTPUT_ROOT/_terravault/logs/force.log)",
+    )
+    force_p.set_defaults(func=cmd_force)
 
     # ------------------------------------------------------------ collections
     col_p = sub.add_parser("collections", help="List collections available in the STAC catalog")

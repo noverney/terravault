@@ -42,3 +42,19 @@ def test_local_dataset_query_and_extraction_imports_are_public():
     assert ExtractionConfig is not None
     assert ExtractionResult is not None
     assert RasterExtractor is not None
+
+
+def test_force_postprocessing_imports_are_public():
+    from terravault import (
+        FORCE_DOCKER_IMAGE,
+        FORCE_VERSION,
+        ForceConfig,
+        ForcePostprocessor,
+        ForceResult,
+    )
+
+    assert FORCE_VERSION == "3.10.04"
+    assert FORCE_DOCKER_IMAGE == "davidfrantz/force:3.10.04"
+    assert ForceConfig is not None
+    assert ForcePostprocessor is not None
+    assert ForceResult is not None

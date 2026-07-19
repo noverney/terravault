@@ -101,3 +101,18 @@ The output band order matches `--asset-keys`. SCL and CLD are resampled from
 their native 20 m grids; the default nearest-neighbour method preserves their
 categorical/probability values. Repeat without `--dry-run` after checking the
 reported dimensions and uncompressed-size estimate.
+
+## FORCE feature cube
+
+Plan or run the same latest-per-tile country extraction and import it as a
+tiled FORCE external feature:
+
+```bash
+python examples/postprocessing/force_switzerland.py --dry-run
+python examples/postprocessing/force_switzerland.py --runtime docker
+```
+
+This is a four-band TerraVault-derived external feature, not FORCE BOA/QAI
+ARD. The wrapper skips an unchanged staging selection, uses stable
+source-derived product names and resumes from atomic job manifests. See
+[FORCE_POSTPROCESSING.md](FORCE_POSTPROCESSING.md).

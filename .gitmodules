@@ -1,0 +1,4 @@
+[submodule "vendor/force"]
+	path = vendor/force
+	url = https://github.com/davidfrantz/force.git
+	ignore = dirty

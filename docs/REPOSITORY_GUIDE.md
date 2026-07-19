@@ -20,8 +20,12 @@ changes do not require rediscovering the repository.
 | `terravault/historical.py` | Windowed historical backfill and progress |
 | `terravault/dataset_catalog.py` | Top-level DuckDB raster-piece catalogue |
 | `terravault/extractor.py` | Block-wise VRT mosaics and stitched multiband COG queries |
-| `terravault/cli.py` | `run`, `watch`, `historic`, `query`, `extract` and `collections` |
+| `terravault/force.py` | Durable FORCE external-feature cube/mosaic bridge |
+| `terravault/cli.py` | `run`, `watch`, `historic`, `query`, `extract`, `force` and `collections` |
 | `examples/switzerland_patch/` | Small-patch and country-scale runnable examples |
+| `examples/query/` | Local DuckDB and stitched-COG API examples |
+| `examples/postprocessing/` | FORCE postprocessing orchestration |
+| `vendor/force/` | FORCE v3.10.04 source pinned as a Git submodule |
 
 The core `Pipeline` is a STAC asset ingester. The Process API helpers are a
 separate path for generated subsets/mosaics. Do not treat the synchronous
@@ -78,6 +82,16 @@ The `overview` extra installs Pillow for the public-thumbnail mosaic. The
    python -m pytest -q tests/test_extractor.py
    ```
 
+8. FORCE command plan and container integration:
+
+   ```bash
+   terravault force \
+     --input satellite_data/switzerland_ndvi/exports/zurich_ndvi_inputs_example.tif \
+     --output-root satellite_data/switzerland_ndvi/force \
+     --runtime docker \
+     --dry-run
+   ```
+
 ## Invariants
 
 - A failed or missing requested asset is not marked ingested.
@@ -91,6 +105,10 @@ The `overview` extra installs Pillow for the public-thumbnail mosaic. The
   pieces remain immutable and partitioned.
 - Extraction pixels stay in GDAL's bounded block pipeline and never become a
   country-sized Python array.
+- Selected TerraVault L2A assets enter FORCE as external features, never as
+  FORCE BOA/QAI ARD; true FORCE Level-2 requires complete Level-1 products.
+- FORCE jobs verify physical chips and mosaics in addition to process exit
+  codes, and reuse an identical completed input by fingerprint.
 - Logs rotate below `STORAGE_ROOT/_terravault/logs/` and never include secrets.
 - Process API width and height never exceed 2500 pixels.
 - Secrets belong in `.env` or a secret manager and must not be committed.

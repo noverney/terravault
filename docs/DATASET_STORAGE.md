@@ -176,7 +176,22 @@ Set `dry_run=False` (or remove that argument) to write the COG. GDAL performs
 the raster work block by block; Python does not load the entire result into
 memory. The complete runnable example, including date filters, JSON output,
 selection options and output safeguards, is
-[`../examples/local_dataset_api.py`](../examples/local_dataset_api.py).
+[`../examples/query/local_dataset_api.py`](../examples/query/local_dataset_api.py).
+
+## FORCE-derived datacubes
+
+FORCE products remain outside `pieces/` because they are derived tiled
+features, not immutable CDSE source assets:
+
+```text
+STORAGE_ROOT/force/
+├── datacube/X####_Y####/FEATURE.tif
+├── datacube/mosaic/FEATURE.vrt
+└── _terravault/force/jobs/FEATURE.json
+```
+
+Their durable manifest links the input COG hash, grid, commands, chip paths
+and mosaic. See [FORCE_POSTPROCESSING.md](FORCE_POSTPROCESSING.md).
 
 ## Operational logs
 

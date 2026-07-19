@@ -26,6 +26,7 @@ tokens. See [Copernicus credentials](#copernicus-credentials) below.
 | **Restartable rolling ingest** | Native CDSE S3 assets, per-asset SQLite queue, resumable transfers and failure sidecars |
 | **DuckDB dataset catalogue** | Top-level spatial/time index for every partitioned local raster piece |
 | **Memory-bounded raster extraction** | Query intersecting pieces and stream one aligned multiband COG through GDAL |
+| **FORCE postprocessing** | Pinned FORCE submodule, Docker/native bridge, restartable feature-cube imports and mosaics |
 | **Operational logs** | Automatic rotating progress, storage, retry, quota and completion logs |
 | **Explicit ROI** | Rolling discovery accepts a WGS84 bbox or Polygon/MultiPolygon GeoJSON |
 | **Historical backfill** | Windowed progress, durable cursor, quota waits and retired jobs |
@@ -40,6 +41,7 @@ tokens. See [Copernicus credentials](#copernicus-credentials) below.
 
 ```bash
 cd /path/to/terravault
+git submodule update --init --recursive
 conda activate terra
 python -m pip install --upgrade pip
 python -m pip install -e .
@@ -245,7 +247,7 @@ Use the downloaded dataset directly from Python without contacting
 Copernicus:
 
 ```bash
-python examples/local_dataset_api.py \
+python examples/query/local_dataset_api.py \
   --dataset-db satellite_data/switzerland_ndvi/dataset.duckdb \
   --bbox 8.45 47.20 8.65 47.35
 ```
@@ -254,7 +256,7 @@ The example uses the public `DatasetCatalog` API to return intersecting local
 paths and metadata. Add `--output exports/zurich_ndvi_inputs.tif` to stream a
 stitched COG, or add `--dry-run` with the output argument to inspect its size
 without writing pixels. See
-[`examples/local_dataset_api.py`](examples/local_dataset_api.py) for the full
+[`examples/query/local_dataset_api.py`](examples/query/local_dataset_api.py) for the full
 Python code.
 
 Query a region and return one stitched RGB image while keeping memory bounded:
@@ -273,6 +275,31 @@ source and the feature-to-band mapping. Country-scale requests can be inspected
 first with `--dry-run`; GDAL does the pixel work block by block under
 `--warp-memory-mib`. See
 [`docs/RASTER_QUERY_AND_EXTRACTION.md`](docs/RASTER_QUERY_AND_EXTRACTION.md).
+
+### FORCE postprocessing
+
+FORCE is pinned as the `vendor/force` Git submodule. TerraVault imports its
+stitched L2A band products through FORCE's supported external-feature
+datacube path; it does not mislabel selected L2A bands as FORCE Level-2 ARD.
+Docker is the default portable runtime.
+
+Plan the current Swiss-wide 10 m B04/B08/SCL/CLD extraction:
+
+```bash
+python examples/postprocessing/force_switzerland.py --dry-run
+```
+
+Run the extraction, FORCE tiling and mosaic:
+
+```bash
+python examples/postprocessing/force_switzerland.py --runtime docker
+```
+
+For an existing stitched COG, run `terravault force` with `--input INPUT.tif`
+and `--output-root OUTPUT_DIR`. Job manifests, input hashes, attempts, exact
+commands, chips and mosaics are persisted, so an interrupted or repeated job
+can be safely rerun. See
+[`docs/FORCE_POSTPROCESSING.md`](docs/FORCE_POSTPROCESSING.md).
 
 ### Historical backfill
 
@@ -302,6 +329,7 @@ Commands:
   historic     Gradually backfill complete native data from a start date
   query        Query local georeferenced raster pieces from dataset DuckDB
   extract      Stream intersecting pieces into one multiband COG
+  force        Import a stitched raster into a FORCE feature datacube
   collections  List collections available in the STAC catalog
 ```
 
@@ -434,7 +462,7 @@ Pipeline(cfg).run()
 ## Development
 
 ```bash
-git clone https://github.com/noverney/terravault
+git clone --recurse-submodules https://github.com/noverney/terravault
 cd terravault
 pip install -e ".[dev]"
 pytest
@@ -451,6 +479,7 @@ pytest
 | `tqdm` | Download progress bars |
 | `rasterio` *(optional)* | Raster I/O and COG conversion |
 | GDAL command-line tools | Block-wise VRT reprojection, mosaicking and COG extraction |
+| FORCE v3.10.04 | Tiled external-feature datacubes and VRT mosaics |
 | `Pillow` *(optional)* | Public-thumbnail country overview |
 | `boto3` *(optional)* | Native CDSE S3 streaming and Range-resume |
 

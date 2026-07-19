@@ -301,6 +301,11 @@ class RasterExtractor:
             )
         return existing
 
+    def query_sources(self) -> list[dict[str, Any]]:
+        """Return the exact local pieces that a subsequent extraction will use."""
+
+        return self._query_sources()
+
     def _target_crs(self, pieces: Sequence[dict[str, Any]]) -> str:
         if self.config.target_crs.lower() != "auto":
             return self.config.target_crs
@@ -479,7 +484,7 @@ class RasterExtractor:
         if self.config.cutline_path is not None and not self.config.cutline_path.is_file():
             raise FileNotFoundError(f"Cutline GeoJSON does not exist: {self.config.cutline_path}")
 
-        pieces = self._query_sources()
+        pieces = self.query_sources()
         target_crs = self._target_crs(pieces)
         resolution = self._resolution(pieces, target_crs)
         grouped = {

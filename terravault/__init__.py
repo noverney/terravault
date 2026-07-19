@@ -6,6 +6,11 @@ __all__ = [
     "DatasetCatalog",
     "ExtractionConfig",
     "ExtractionResult",
+    "FORCE_DOCKER_IMAGE",
+    "FORCE_VERSION",
+    "ForceConfig",
+    "ForcePostprocessor",
+    "ForceResult",
     "HistoricalConfig",
     "HistoricalIngestor",
     "HistoricalRunResult",
@@ -54,6 +59,28 @@ def __getattr__(name: str):
             "ExtractionConfig": ExtractionConfig,
             "ExtractionResult": ExtractionResult,
             "RasterExtractor": RasterExtractor,
+        }[name]
+    if name in {
+        "FORCE_DOCKER_IMAGE",
+        "FORCE_VERSION",
+        "ForceConfig",
+        "ForcePostprocessor",
+        "ForceResult",
+    }:
+        from .force import (
+            FORCE_DOCKER_IMAGE,
+            FORCE_VERSION,
+            ForceConfig,
+            ForcePostprocessor,
+            ForceResult,
+        )
+
+        return {
+            "FORCE_DOCKER_IMAGE": FORCE_DOCKER_IMAGE,
+            "FORCE_VERSION": FORCE_VERSION,
+            "ForceConfig": ForceConfig,
+            "ForcePostprocessor": ForcePostprocessor,
+            "ForceResult": ForceResult,
         }[name]
     if name in {
         "HistoricalConfig",
