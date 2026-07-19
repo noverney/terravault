@@ -76,6 +76,15 @@ def _default_log_file(args: argparse.Namespace) -> Path | None:
     output_root = getattr(args, "output_root", None)
     if output_root:
         return Path(output_root) / "_terravault" / "logs" / f"{args.command}.log"
+    if getattr(args, "command", None) == "force-visualize":
+        from .force_visualization import ForceVisualizationConfig
+
+        config = ForceVisualizationConfig(
+            input_path=Path(args.input),
+            output_dir=None if args.output_dir is None else Path(args.output_dir),
+        )
+        assert config.output_dir is not None
+        return config.output_dir / "_terravault" / "logs" / "force-visualize.log"
     return None
 
 
@@ -451,6 +460,49 @@ def cmd_force(args: argparse.Namespace) -> int:
         f"  cube={result.cube_root}"
         f"  chips={len(result.chip_paths)}"
         f"  mosaic={result.mosaic_path}"
+        f"  manifest={result.manifest_path}"
+    )
+    if result.status == "planned":
+        print("Commands:")
+        for command in result.commands:
+            print(f"  {shlex.join(command)}")
+    return 0
+
+
+def cmd_force_visualize(args: argparse.Namespace) -> int:
+    import shlex
+
+    from .force_visualization import ForceVisualizationConfig, ForceVisualizer
+
+    try:
+        result = ForceVisualizer(
+            ForceVisualizationConfig(
+                input_path=Path(args.input),
+                output_dir=None if args.output_dir is None else Path(args.output_dir),
+                output_stem=args.output_stem,
+                red_band=args.red_band,
+                nir_band=args.nir_band,
+                scl_band=args.scl_band,
+                cloud_band=args.cloud_band,
+                mask_quality=not args.no_quality_mask,
+                cloud_threshold=args.cloud_threshold,
+                crop_to_force_input=not args.no_crop_to_force_input,
+                quicklook_width=args.quicklook_width,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+        ).run()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    duplicate = " (unchanged; skipped)" if result.skipped else ""
+    print(
+        f"FORCE visualization {result.status}{duplicate}"
+        f"  ndvi={result.ndvi_path}"
+        f"  quicklook={result.quicklook_path}"
+        f"  size={result.width}x{result.height}"
+        f"  valid_percent={result.valid_percent}"
         f"  manifest={result.manifest_path}"
     )
     if result.status == "planned":
@@ -1296,6 +1348,81 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rotating log path (default: OUTPUT_ROOT/_terravault/logs/force.log)",
     )
     force_p.set_defaults(func=cmd_force)
+
+    # ------------------------------------------------------ force-visualize
+    force_visualize_p = sub.add_parser(
+        "force-visualize",
+        help="Create a quality-masked NDVI COG and PNG from a FORCE mosaic",
+    )
+    force_visualize_p.add_argument(
+        "--env-file",
+        default=".env",
+        metavar="PATH",
+        help="Optional .env file (default: .env)",
+    )
+    force_visualize_p.add_argument(
+        "--input",
+        required=True,
+        metavar="VRT_OR_TIFF",
+        help="FORCE multiband mosaic or chip",
+    )
+    force_visualize_p.add_argument(
+        "--output-dir",
+        default=None,
+        metavar="DIR",
+        help="Output directory (default: FORCE_ROOT/visualizations)",
+    )
+    force_visualize_p.add_argument(
+        "--output-stem",
+        default=None,
+        metavar="NAME",
+        help="Output filename stem (default: INPUT_STEM_ndvi)",
+    )
+    force_visualize_p.add_argument("--red-band", type=int, default=None, metavar="N")
+    force_visualize_p.add_argument("--nir-band", type=int, default=None, metavar="N")
+    force_visualize_p.add_argument("--scl-band", type=int, default=None, metavar="N")
+    force_visualize_p.add_argument("--cloud-band", type=int, default=None, metavar="N")
+    force_visualize_p.add_argument(
+        "--cloud-threshold",
+        type=float,
+        default=50,
+        metavar="PCT",
+        help="Mask CLD probabilities above this percentage (default: 50)",
+    )
+    force_visualize_p.add_argument(
+        "--no-quality-mask",
+        action="store_true",
+        help="Calculate NDVI without SCL and CLD masks",
+    )
+    force_visualize_p.add_argument(
+        "--no-crop-to-force-input",
+        action="store_true",
+        help="Retain complete FORCE tile extents instead of the original input bounds",
+    )
+    force_visualize_p.add_argument(
+        "--quicklook-width",
+        type=int,
+        default=1400,
+        metavar="PX",
+        help="Maximum PNG width (default: 1400)",
+    )
+    force_visualize_p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace changed visualization products",
+    )
+    force_visualize_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and show the NDVI calculation without writing pixels",
+    )
+    force_visualize_p.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Rotating visualization log path",
+    )
+    force_visualize_p.set_defaults(func=cmd_force_visualize)
 
     # ------------------------------------------------------------ collections
     col_p = sub.add_parser("collections", help="List collections available in the STAC catalog")

@@ -28,6 +28,19 @@ python examples/postprocessing/force_switzerland.py \
   --input satellite_data/switzerland_ndvi/exports/switzerland_inputs.tif
 ```
 
+Visualize the resulting FORCE mosaic:
+
+```bash
+python examples/postprocessing/visualize_force.py \
+  --input satellite_data/switzerland_ndvi/force/datacube/mosaic/FEATURE.vrt
+```
+
+The visualization step computes `(B08 - B04) / (B08 + B04)` as a Float32
+Cloud Optimized GeoTIFF, masks invalid/cloudy pixels using SCL and CLD, and
+writes a colorized PNG plus world file and provenance manifest. It crops away
+FORCE tile padding when the original TerraVault input is recorded in the job
+manifest.
+
 See [`docs/FORCE_POSTPROCESSING.md`](../../docs/FORCE_POSTPROCESSING.md) for
 the compatibility boundary, Docker and submodule setup, restart semantics,
 cron use and output structure.

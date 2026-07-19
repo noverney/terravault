@@ -27,6 +27,7 @@ tokens. See [Copernicus credentials](#copernicus-credentials) below.
 | **DuckDB dataset catalogue** | Top-level spatial/time index for every partitioned local raster piece |
 | **Memory-bounded raster extraction** | Query intersecting pieces and stream one aligned multiband COG through GDAL |
 | **FORCE postprocessing** | Pinned FORCE submodule, Docker/native bridge, restartable feature-cube imports and mosaics |
+| **FORCE visualization** | Quality-masked NDVI COGs and georeferenced color PNG quicklooks |
 | **Operational logs** | Automatic rotating progress, storage, retry, quota and completion logs |
 | **Explicit ROI** | Rolling discovery accepts a WGS84 bbox or Polygon/MultiPolygon GeoJSON |
 | **Historical backfill** | Windowed progress, durable cursor, quota waits and retired jobs |
@@ -303,6 +304,16 @@ commands, chips and mosaics are persisted, so an interrupted or repeated job
 can be safely rerun. See
 [`docs/FORCE_POSTPROCESSING.md`](docs/FORCE_POSTPROCESSING.md).
 
+Turn a FORCE B04/B08/SCL/CLD mosaic into a viewable NDVI product:
+
+```bash
+terravault force-visualize \
+  --input satellite_data/switzerland_ndvi/force_zurich_example/datacube/mosaic/switzerland_ndvi_20260717T103029Z_a9fbf8e0c6.vrt
+```
+
+This creates a georeferenced Float32 NDVI COG, color PNG, world file and
+provenance manifest under the FORCE root's `visualizations/` directory.
+
 ### Historical backfill
 
 Backfill the complete native profile from a specified start date:
@@ -332,6 +343,7 @@ Commands:
   query        Query local georeferenced raster pieces from dataset DuckDB
   extract      Stream intersecting pieces into one multiband COG
   force        Import a stitched raster into a FORCE feature datacube
+  force-visualize  Create an NDVI COG and color quicklook from FORCE
   collections  List collections available in the STAC catalog
 ```
 

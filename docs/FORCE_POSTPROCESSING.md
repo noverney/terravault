@@ -165,6 +165,49 @@ the source archive is a practical starting point. Python never loads this
 array: GDAL streams the COG with a configurable `--warp-memory-mib` budget,
 and FORCE processes it tile by tile.
 
+## Visualize a FORCE mosaic
+
+FORCE mosaics are VRT datasets: they provide a joined georeferenced view but
+are not conventional pictures. Create an analysis-ready NDVI COG and a
+viewable quicklook with:
+
+```bash
+terravault force-visualize \
+  --input satellite_data/switzerland_ndvi/force_zurich_example/datacube/mosaic/switzerland_ndvi_20260717T103029Z_a9fbf8e0c6.vrt
+```
+
+Equivalent example script:
+
+```bash
+python examples/postprocessing/visualize_force.py --input FORCE_MOSAIC.vrt
+```
+
+Default outputs are written under `FORCE_ROOT/visualizations/`:
+
+```text
+FEATURE_ndvi.tif
+FEATURE_ndvi.png
+FEATURE_ndvi.wld
+FEATURE_ndvi.visualization.json
+_terravault/logs/force-visualize.log
+```
+
+The GeoTIFF is a georeferenced Float32 COG with `-9999` nodata. The PNG is a
+compact RGBA color relief, and its world file retains map placement. By
+default, the calculation:
+
+- uses band descriptions to locate B04, B08, SCL and CLD;
+- masks SCL 0, 1, 3, 8, 9, 10 and 11;
+- masks CLD values above 50%;
+- excludes nodata and zero denominators;
+- crops FORCE tile padding to the original TerraVault input bounds;
+- records source files, palette, statistics and exact GDAL commands.
+
+Use `--cloud-threshold`, explicit band-number options,
+`--no-quality-mask`, or `--no-crop-to-force-input` to change those choices.
+Unchanged inputs are skipped using the visualization manifest; use
+`--overwrite` after intentionally changing parameters.
+
 ## Rolling operation and cron
 
 The acquisition worker remains responsible for polling CDSE. The

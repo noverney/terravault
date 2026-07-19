@@ -21,7 +21,8 @@ changes do not require rediscovering the repository.
 | `terravault/dataset_catalog.py` | Top-level DuckDB raster-piece catalogue |
 | `terravault/extractor.py` | Block-wise VRT mosaics and stitched multiband COG queries |
 | `terravault/force.py` | Durable FORCE external-feature cube/mosaic bridge |
-| `terravault/cli.py` | `run`, `watch`, `historic`, `query`, `extract`, `force` and `collections` |
+| `terravault/force_visualization.py` | NDVI COG and color quicklook generation |
+| `terravault/cli.py` | `run`, `watch`, `historic`, `query`, `extract`, `force`, `force-visualize` and `collections` |
 | `examples/switzerland_patch/` | Small-patch and country-scale runnable examples |
 | `examples/query/` | Local DuckDB and stitched-COG API examples |
 | `examples/postprocessing/` | FORCE postprocessing orchestration |
@@ -92,6 +93,12 @@ The `overview` extra installs Pillow for the public-thumbnail mosaic. The
      --dry-run
    ```
 
+9. FORCE NDVI/PNG visualization:
+
+   ```bash
+   python -m pytest -q tests/test_force_visualization.py
+   ```
+
 ## Invariants
 
 - A failed or missing requested asset is not marked ingested.
@@ -109,6 +116,8 @@ The `overview` extra installs Pillow for the public-thumbnail mosaic. The
   FORCE BOA/QAI ARD; true FORCE Level-2 requires complete Level-1 products.
 - FORCE jobs verify physical chips and mosaics in addition to process exit
   codes, and reuse an identical completed input by fingerprint.
+- FORCE visualizations keep pixel calculation in GDAL, retain a georeferenced
+  Float32 COG and record masks, colors, statistics and commands.
 - Logs rotate below `STORAGE_ROOT/_terravault/logs/` and never include secrets.
 - Process API width and height never exceed 2500 pixels.
 - Secrets belong in `.env` or a secret manager and must not be committed.

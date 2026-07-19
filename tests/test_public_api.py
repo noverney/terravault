@@ -60,3 +60,15 @@ def test_force_postprocessing_imports_are_public():
     assert ForceConfig is not None
     assert ForcePostprocessor is not None
     assert ForceResult is not None
+
+
+def test_force_visualization_imports_are_public():
+    from terravault import (
+        ForceVisualizationConfig,
+        ForceVisualizationResult,
+        ForceVisualizer,
+    )
+
+    assert ForceVisualizationConfig is not None
+    assert ForceVisualizationResult is not None
+    assert ForceVisualizer is not None

@@ -116,3 +116,12 @@ This is a four-band TerraVault-derived external feature, not FORCE BOA/QAI
 ARD. The wrapper skips an unchanged staging selection, uses stable
 source-derived product names and resumes from atomic job manifests. See
 [FORCE_POSTPROCESSING.md](FORCE_POSTPROCESSING.md).
+
+Create a colorized, quality-masked NDVI view from the FORCE mosaic:
+
+```bash
+terravault force-visualize --input FORCE_ROOT/datacube/mosaic/FEATURE.vrt
+```
+
+The resulting PNG is for inspection; use the accompanying Float32 COG for
+geospatial analysis.
