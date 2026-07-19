@@ -241,6 +241,22 @@ asset keys, cron, state tables, retry behaviour and operations.
 See [`docs/DATASET_STORAGE.md`](docs/DATASET_STORAGE.md) for the partitioned
 layout, DuckDB schema, raster queries and log retention.
 
+Use the downloaded dataset directly from Python without contacting
+Copernicus:
+
+```bash
+python examples/local_dataset_api.py \
+  --dataset-db satellite_data/switzerland_ndvi/dataset.duckdb \
+  --bbox 8.45 47.20 8.65 47.35
+```
+
+The example uses the public `DatasetCatalog` API to return intersecting local
+paths and metadata. Add `--output exports/zurich_ndvi_inputs.tif` to stream a
+stitched COG, or add `--dry-run` with the output argument to inspect its size
+without writing pixels. See
+[`examples/local_dataset_api.py`](examples/local_dataset_api.py) for the full
+Python code.
+
 Query a region and return one stitched RGB image while keeping memory bounded:
 
 ```bash

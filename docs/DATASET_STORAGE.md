@@ -126,6 +126,58 @@ The WGS84 item footprint is used for spatial selection. Raster-native bounds
 remain paired with their `proj_epsg`, avoiding invalid comparisons between
 longitude/latitude and UTM coordinates.
 
+## Python API
+
+Querying the local dataset does not contact Copernicus or require credentials:
+
+```python
+from pathlib import Path
+
+from terravault import DatasetCatalog
+
+database = Path("satellite_data/switzerland_ndvi/dataset.duckdb")
+catalog = DatasetCatalog(database)
+
+print(catalog.summary())
+pieces = catalog.query_raster_pieces(
+    bbox=(8.45, 47.20, 8.65, 47.35),
+    asset_keys=("B04_10m", "B08_10m", "SCL_20m", "CLD_20m"),
+)
+for piece in pieces:
+    print(
+        piece["acquisition_time"],
+        piece["tile_id"],
+        piece["asset_key"],
+        piece["local_path"],
+    )
+```
+
+Create a stitched result through the same public package API:
+
+```python
+from terravault import ExtractionConfig, RasterExtractor
+
+result = RasterExtractor(
+    ExtractionConfig(
+        dataset_db=database,
+        bbox=(8.45, 47.20, 8.65, 47.35),
+        asset_keys=("B04_10m", "B08_10m", "SCL_20m", "CLD_20m"),
+        output_path=Path("exports/zurich_ndvi_inputs.tif"),
+        target_crs="EPSG:2056",
+        resolution=10,
+        warp_memory_mib=256,
+        dry_run=True,
+    )
+).extract()
+print(result)
+```
+
+Set `dry_run=False` (or remove that argument) to write the COG. GDAL performs
+the raster work block by block; Python does not load the entire result into
+memory. The complete runnable example, including date filters, JSON output,
+selection options and output safeguards, is
+[`../examples/local_dataset_api.py`](../examples/local_dataset_api.py).
+
 ## Operational logs
 
 Logs are created automatically:

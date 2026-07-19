@@ -28,3 +28,17 @@ def test_ndvi_profile_is_public():
         "SCL_20m",
         "CLD_20m",
     )
+
+
+def test_local_dataset_query_and_extraction_imports_are_public():
+    from terravault import (
+        DatasetCatalog,
+        ExtractionConfig,
+        ExtractionResult,
+        RasterExtractor,
+    )
+
+    assert DatasetCatalog is not None
+    assert ExtractionConfig is not None
+    assert ExtractionResult is not None
+    assert RasterExtractor is not None
