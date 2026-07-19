@@ -124,4 +124,5 @@ terravault force-visualize --input FORCE_ROOT/datacube/mosaic/FEATURE.vrt
 ```
 
 The resulting PNG is for inspection; use the accompanying Float32 COG for
-geospatial analysis.
+geospatial analysis. The adjacent `*_before_after.png` debug plot shows raw
+NDVI and the quality-masked result side by side on one color scale.

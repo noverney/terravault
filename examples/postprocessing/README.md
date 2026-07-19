@@ -39,7 +39,9 @@ The visualization step computes `(B08 - B04) / (B08 + B04)` as a Float32
 Cloud Optimized GeoTIFF, masks invalid/cloudy pixels using SCL and CLD, and
 writes a colorized PNG plus world file and provenance manifest. It crops away
 FORCE tile padding when the original TerraVault input is recorded in the job
-manifest.
+manifest. A labelled `*_before_after.png` uses the same palette to compare
+raw NDVI with the SCL/CLD-masked output and reports how many valid-pixel
+percentage points the mask removed.
 
 See [`docs/FORCE_POSTPROCESSING.md`](../../docs/FORCE_POSTPROCESSING.md) for
 the compatibility boundary, Docker and submodule setup, restart semantics,

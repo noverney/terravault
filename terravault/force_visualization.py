@@ -69,6 +69,8 @@ class ForceVisualizationConfig:
     invalid_scl_classes: tuple[int, ...] = DEFAULT_INVALID_SCL_CLASSES
     crop_to_force_input: bool = True
     quicklook_width: int = 1400
+    debug_plot: bool = True
+    debug_plot_width: int = 1800
     overwrite: bool = False
     dry_run: bool = False
 
@@ -94,6 +96,8 @@ class ForceVisualizationConfig:
             raise ValueError("cloud_threshold must be between 0 and 100")
         if self.quicklook_width < 64:
             raise ValueError("quicklook_width must be at least 64 pixels")
+        if self.debug_plot_width < 640:
+            raise ValueError("debug_plot_width must be at least 640 pixels")
         classes = tuple(dict.fromkeys(int(value) for value in self.invalid_scl_classes))
         if any(value < 0 or value > 11 for value in classes):
             raise ValueError("Sentinel-2 SCL classes must be between 0 and 11")
@@ -113,11 +117,13 @@ class ForceVisualizationResult:
     status: str
     ndvi_path: Path
     quicklook_path: Path
+    debug_plot_path: Path | None
     worldfile_path: Path
     manifest_path: Path
     width: int
     height: int
     valid_percent: float | None
+    raw_valid_percent: float | None
     commands: tuple[tuple[str, ...], ...]
     skipped: bool = False
 
@@ -131,6 +137,11 @@ class ForceVisualizer:
         assert config.output_stem is not None
         self.ndvi_path = config.output_dir / f"{config.output_stem}.tif"
         self.quicklook_path = config.output_dir / f"{config.output_stem}.png"
+        self.debug_plot_path = (
+            config.output_dir / f"{config.output_stem}_before_after.png"
+            if config.debug_plot
+            else None
+        )
         self.worldfile_path = config.output_dir / f"{config.output_stem}.wld"
         self.manifest_path = config.output_dir / f"{config.output_stem}.visualization.json"
         self._commands: list[tuple[str, ...]] = []
@@ -309,6 +320,8 @@ class ForceVisualizer:
             "cloud_threshold": self.config.cloud_threshold,
             "invalid_scl_classes": self.config.invalid_scl_classes,
             "quicklook_width": self.config.quicklook_width,
+            "debug_plot": self.config.debug_plot,
+            "debug_plot_width": self.config.debug_plot_width,
             "crop_to_force_input": self.config.crop_to_force_input,
             "bands": {
                 "red": self.config.red_band,
@@ -344,6 +357,7 @@ class ForceVisualizer:
         metadata: dict[str, Any],
         raw_path: Path,
         crop_bounds: tuple[float, float, float, float] | None,
+        mask_quality: bool,
     ) -> list[str]:
         red_nodata = self._band_nodata(metadata, bands["red"])
         nir_nodata = self._band_nodata(metadata, bands["nir"])
@@ -361,7 +375,7 @@ class ForceVisualizer:
             str(self.config.input_path),
             f"--B_band={bands['red']}",
         ]
-        if self.config.mask_quality:
+        if mask_quality:
             scl_nodata = self._band_nodata(metadata, bands["scl"])
             cloud_nodata = self._band_nodata(metadata, bands["cloud"])
             invalid = ",".join(str(value) for value in self.config.invalid_scl_classes)
@@ -405,6 +419,172 @@ class ForceVisualizer:
             command.extend(("--projwin", *(str(value) for value in crop_bounds)))
         return command
 
+    @staticmethod
+    def _statistics(metadata: dict[str, Any]) -> tuple[dict[str, Any], float | None]:
+        statistics = (
+            (metadata.get("bands") or [{}])[0]
+            .get("metadata", {})
+            .get("", {})
+        )
+        value = statistics.get("STATISTICS_VALID_PERCENT")
+        return statistics, None if value is None else float(value)
+
+    @staticmethod
+    def _palette_color(value: float) -> tuple[int, int, int]:
+        points = [
+            (stop, (red, green, blue))
+            for stop, red, green, blue, _alpha, _label in NDVI_COLORS
+        ]
+        if value <= points[0][0]:
+            return points[0][1]
+        for (lower, lower_color), (upper, upper_color) in zip(points, points[1:]):
+            if value <= upper:
+                fraction = (value - lower) / (upper - lower)
+                return tuple(
+                    round(start + fraction * (end - start))
+                    for start, end in zip(lower_color, upper_color)
+                )
+        return points[-1][1]
+
+    def _compose_debug_plot(
+        self,
+        *,
+        raw_quicklook_path: Path,
+        masked_quicklook_path: Path,
+        output_path: Path,
+        raw_valid_percent: float | None,
+        valid_percent: float | None,
+    ) -> None:
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError as exc:
+            raise RuntimeError(
+                "Pillow is required for the before/after debug plot; install "
+                'TerraVault with `pip install "terravault[visualization]"` or '
+                "pass --no-debug-plot"
+            ) from exc
+
+        canvas_width = self.config.debug_plot_width
+        padding = 32
+        gap = 20
+        panel_width = (canvas_width - (2 * padding) - gap) // 2
+
+        def font(size: int):
+            return ImageFont.load_default(size=size)
+
+        def panel(path: Path):
+            with Image.open(path) as source:
+                image = source.convert("RGBA")
+            target_height = max(1, round(image.height * panel_width / image.width))
+            image = image.resize(
+                (panel_width, target_height),
+                Image.Resampling.LANCZOS,
+            )
+            checker = Image.new("RGBA", image.size, (230, 233, 237, 255))
+            checker_draw = ImageDraw.Draw(checker)
+            square = 16
+            for y in range(0, image.height, square):
+                for x in range(0, image.width, square):
+                    if (x // square + y // square) % 2:
+                        checker_draw.rectangle(
+                            (x, y, x + square - 1, y + square - 1),
+                            fill=(210, 215, 221, 255),
+                        )
+            return Image.alpha_composite(checker, image).convert("RGB")
+
+        before = panel(raw_quicklook_path)
+        after = panel(masked_quicklook_path)
+        panel_height = max(before.height, after.height)
+        panel_y = 126
+        statistic_y = panel_y + panel_height + 14
+        legend_y = statistic_y + 52
+        canvas_height = legend_y + 84
+        canvas = Image.new("RGB", (canvas_width, canvas_height), (20, 25, 32))
+        draw = ImageDraw.Draw(canvas)
+        title_font = font(28)
+        heading_font = font(20)
+        body_font = font(16)
+        muted = (181, 190, 201)
+        draw.text((padding, 20), "NDVI quality-mask diagnostic", fill="white", font=title_font)
+        draw.text(
+            (padding, 58),
+            self.config.input_path.name,
+            fill=muted,
+            font=body_font,
+        )
+        after_x = padding + panel_width + gap
+        draw.text(
+            (padding, 94),
+            "BEFORE · raw B04/B08 NDVI",
+            fill=(238, 242, 247),
+            font=heading_font,
+        )
+        after_label = (
+            "AFTER · SCL + CLD quality mask"
+            if self.config.mask_quality
+            else "AFTER · quality mask disabled"
+        )
+        draw.text(
+            (after_x, 94),
+            after_label,
+            fill=(238, 242, 247),
+            font=heading_font,
+        )
+        canvas.paste(before, (padding, panel_y))
+        canvas.paste(after, (after_x, panel_y))
+
+        raw_text = (
+            "raw valid pixels: unavailable"
+            if raw_valid_percent is None
+            else f"raw valid pixels: {raw_valid_percent:.2f}%"
+        )
+        after_text = (
+            "after valid pixels: unavailable"
+            if valid_percent is None
+            else f"after valid pixels: {valid_percent:.2f}%"
+        )
+        if raw_valid_percent is not None and valid_percent is not None:
+            removed = max(0.0, raw_valid_percent - valid_percent)
+            after_text += f"  ·  masked: {removed:.2f} percentage points"
+        draw.text((padding, statistic_y), raw_text, fill=muted, font=body_font)
+        draw.text((after_x, statistic_y), after_text, fill=muted, font=body_font)
+
+        legend_left = padding
+        legend_right = canvas_width - padding
+        legend_top = legend_y + 2
+        for x in range(legend_left, legend_right):
+            fraction = (x - legend_left) / max(1, legend_right - legend_left - 1)
+            value = -1.0 + (2.0 * fraction)
+            draw.line(
+                (x, legend_top, x, legend_top + 18),
+                fill=self._palette_color(value),
+            )
+        draw.rectangle(
+            (legend_left, legend_top, legend_right - 1, legend_top + 18),
+            outline=(105, 114, 126),
+        )
+        for value, label in ((-1.0, "-1"), (-0.5, "-0.5"), (0.0, "0"), (0.5, "0.5"), (1.0, "1")):
+            x = legend_left + round(((value + 1.0) / 2.0) * (legend_right - legend_left - 1))
+            draw.line((x, legend_top + 19, x, legend_top + 25), fill=muted)
+            text_box = draw.textbbox((0, 0), label, font=body_font)
+            text_width = text_box[2] - text_box[0]
+            draw.text((x - text_width // 2, legend_top + 29), label, fill=muted, font=body_font)
+        draw.text(
+            (legend_left, legend_top + 52),
+            "water / low NDVI",
+            fill=muted,
+            font=body_font,
+        )
+        right_label = "dense vegetation"
+        right_box = draw.textbbox((0, 0), right_label, font=body_font)
+        draw.text(
+            (legend_right - (right_box[2] - right_box[0]), legend_top + 52),
+            right_label,
+            fill=muted,
+            font=body_font,
+        )
+        canvas.save(output_path, format="PNG", optimize=True)
+
     def _result(
         self,
         *,
@@ -412,17 +592,20 @@ class ForceVisualizer:
         width: int,
         height: int,
         valid_percent: float | None,
+        raw_valid_percent: float | None = None,
         skipped: bool = False,
     ) -> ForceVisualizationResult:
         return ForceVisualizationResult(
             status=status,
             ndvi_path=self.ndvi_path,
             quicklook_path=self.quicklook_path,
+            debug_plot_path=self.debug_plot_path,
             worldfile_path=self.worldfile_path,
             manifest_path=self.manifest_path,
             width=width,
             height=height,
             valid_percent=valid_percent,
+            raw_valid_percent=raw_valid_percent,
             commands=tuple(self._commands),
             skipped=skipped,
         )
@@ -440,7 +623,9 @@ class ForceVisualizer:
         bands = self._bands(metadata)
         fingerprint, input_files = self._fingerprint()
         existing = self._existing_manifest()
-        product_paths = (self.ndvi_path, self.quicklook_path, self.worldfile_path)
+        product_paths = [self.ndvi_path, self.quicklook_path, self.worldfile_path]
+        if self.debug_plot_path is not None:
+            product_paths.append(self.debug_plot_path)
         products_exist = all(path.is_file() for path in product_paths)
         if (
             existing
@@ -459,6 +644,7 @@ class ForceVisualizer:
                 width=int(existing["width"]),
                 height=int(existing["height"]),
                 valid_percent=existing.get("valid_percent"),
+                raw_valid_percent=existing.get("raw_valid_percent"),
                 skipped=True,
             )
         if any(path.exists() for path in product_paths) and not self.config.overwrite:
@@ -476,8 +662,23 @@ class ForceVisualizer:
                     metadata=metadata,
                     raw_path=planned_raw,
                     crop_bounds=crop_bounds,
+                    mask_quality=self.config.mask_quality,
                 )
             )
+            if self.config.debug_plot and self.config.mask_quality:
+                planned_before = (
+                    self.config.output_dir
+                    / f".{self.config.output_stem}.before.raw.tif"
+                )
+                self._execute(
+                    self._calculation(
+                        bands=bands,
+                        metadata=metadata,
+                        raw_path=planned_before,
+                        crop_bounds=crop_bounds,
+                        mask_quality=False,
+                    )
+                )
             return self._result(
                 status="planned",
                 width=int(metadata["size"][0]),
@@ -492,10 +693,14 @@ class ForceVisualizer:
             dir=self.config.output_dir,
         ) as temporary:
             temporary_path = Path(temporary)
-            raw_path = temporary_path / "ndvi-raw.tif"
+            calculated_path = temporary_path / "ndvi-calculated.tif"
             ndvi_path = temporary_path / "ndvi.tif"
             color_path = temporary_path / "ndvi-color.tif"
             quicklook_path = temporary_path / "ndvi.png"
+            before_path = temporary_path / "ndvi-before.tif"
+            before_color_path = temporary_path / "ndvi-before-color.tif"
+            before_quicklook_path = temporary_path / "ndvi-before.png"
+            debug_plot_path = temporary_path / "ndvi-before-after.png"
             palette_path = temporary_path / "ndvi-colors.txt"
             palette_path.write_text(self._palette_text(), encoding="utf-8")
 
@@ -503,8 +708,9 @@ class ForceVisualizer:
                 self._calculation(
                     bands=bands,
                     metadata=metadata,
-                    raw_path=raw_path,
+                    raw_path=calculated_path,
                     crop_bounds=crop_bounds,
+                    mask_quality=self.config.mask_quality,
                 )
             )
             self._execute(
@@ -524,22 +730,13 @@ class ForceVisualizer:
                     "TERRAVAULT_PRODUCT=NDVI",
                     "-mo",
                     f"TERRAVAULT_SOURCE={self.config.input_path}",
-                    str(raw_path),
+                    str(calculated_path),
                     str(ndvi_path),
                 )
             )
             ndvi_metadata = self._inspect(ndvi_path, statistics=True)
             width, height = (int(value) for value in ndvi_metadata["size"])
-            statistics = (
-                (ndvi_metadata.get("bands") or [{}])[0]
-                .get("metadata", {})
-                .get("", {})
-            )
-            valid_percent = (
-                None
-                if statistics.get("STATISTICS_VALID_PERCENT") is None
-                else float(statistics["STATISTICS_VALID_PERCENT"])
-            )
+            statistics, valid_percent = self._statistics(ndvi_metadata)
             self._execute(
                 (
                     self._gdal["gdaldem"],
@@ -576,15 +773,74 @@ class ForceVisualizer:
             generated_worldfile = quicklook_path.with_suffix(".wld")
             if not generated_worldfile.is_file():
                 raise RuntimeError("GDAL did not create the PNG world file")
-            for source, destination in (
+
+            raw_valid_percent: float | None = None
+            if self.debug_plot_path is not None:
+                if self.config.mask_quality:
+                    self._execute(
+                        self._calculation(
+                            bands=bands,
+                            metadata=metadata,
+                            raw_path=before_path,
+                            crop_bounds=crop_bounds,
+                            mask_quality=False,
+                        )
+                    )
+                    before_metadata = self._inspect(before_path, statistics=True)
+                    _raw_statistics, raw_valid_percent = self._statistics(before_metadata)
+                else:
+                    before_path = calculated_path
+                    raw_valid_percent = valid_percent
+                self._execute(
+                    (
+                        self._gdal["gdaldem"],
+                        "color-relief",
+                        "-alpha",
+                        "-of",
+                        "GTiff",
+                        "-co",
+                        "TILED=YES",
+                        "-co",
+                        "COMPRESS=DEFLATE",
+                        str(before_path),
+                        str(palette_path),
+                        str(before_color_path),
+                    )
+                )
+                self._execute(
+                    (
+                        self._gdal["gdal_translate"],
+                        "-of",
+                        "PNG",
+                        "-outsize",
+                        str(quicklook_width),
+                        "0",
+                        "-r",
+                        "average",
+                        str(before_color_path),
+                        str(before_quicklook_path),
+                    )
+                )
+                self._compose_debug_plot(
+                    raw_quicklook_path=before_quicklook_path,
+                    masked_quicklook_path=quicklook_path,
+                    output_path=debug_plot_path,
+                    raw_valid_percent=raw_valid_percent,
+                    valid_percent=valid_percent,
+                )
+
+            replacements = [
                 (ndvi_path, self.ndvi_path),
                 (quicklook_path, self.quicklook_path),
                 (generated_worldfile, self.worldfile_path),
-            ):
+            ]
+            if self.debug_plot_path is not None:
+                replacements.append((debug_plot_path, self.debug_plot_path))
+            for source, destination in replacements:
                 os.replace(source, destination)
 
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "status": "complete",
             "fingerprint": fingerprint,
@@ -603,10 +859,19 @@ class ForceVisualizer:
             "ndvi_formula": "(B08 - B04) / (B08 + B04)",
             "ndvi_path": str(self.ndvi_path),
             "quicklook_path": str(self.quicklook_path),
+            "debug_plot_path": (
+                None if self.debug_plot_path is None else str(self.debug_plot_path)
+            ),
             "worldfile_path": str(self.worldfile_path),
             "width": width,
             "height": height,
             "valid_percent": valid_percent,
+            "raw_valid_percent": raw_valid_percent,
+            "masked_percentage_points": (
+                None
+                if raw_valid_percent is None or valid_percent is None
+                else round(max(0.0, raw_valid_percent - valid_percent), 6)
+            ),
             "statistics": statistics,
             "palette": [
                 {
@@ -620,9 +885,11 @@ class ForceVisualizer:
         }
         _write_json_atomic(self.manifest_path, manifest)
         logger.info(
-            "FORCE visualization complete – ndvi=%s quicklook=%s valid=%.2f%%",
+            "FORCE visualization complete – ndvi=%s quicklook=%s debug_plot=%s "
+            "valid=%.2f%%",
             self.ndvi_path,
             self.quicklook_path,
+            self.debug_plot_path,
             valid_percent or 0,
         )
         return self._result(
@@ -630,4 +897,5 @@ class ForceVisualizer:
             width=width,
             height=height,
             valid_percent=valid_percent,
+            raw_valid_percent=raw_valid_percent,
         )

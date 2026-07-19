@@ -307,12 +307,16 @@ can be safely rerun. See
 Turn a FORCE B04/B08/SCL/CLD mosaic into a viewable NDVI product:
 
 ```bash
+python -m pip install -e ".[visualization]"
 terravault force-visualize \
   --input satellite_data/switzerland_ndvi/force_zurich_example/datacube/mosaic/switzerland_ndvi_20260717T103029Z_a9fbf8e0c6.vrt
 ```
 
 This creates a georeferenced Float32 NDVI COG, color PNG, world file and
-provenance manifest under the FORCE root's `visualizations/` directory.
+provenance manifest under the FORCE root's `visualizations/` directory. It
+also creates a labelled `*_before_after.png` diagnostic using the same color
+scale: raw B04/B08 NDVI on the left and the SCL/CLD-masked result on the
+right.
 
 ### Historical backfill
 

@@ -488,6 +488,8 @@ def cmd_force_visualize(args: argparse.Namespace) -> int:
                 cloud_threshold=args.cloud_threshold,
                 crop_to_force_input=not args.no_crop_to_force_input,
                 quicklook_width=args.quicklook_width,
+                debug_plot=not args.no_debug_plot,
+                debug_plot_width=args.debug_plot_width,
                 overwrite=args.overwrite,
                 dry_run=args.dry_run,
             )
@@ -501,6 +503,7 @@ def cmd_force_visualize(args: argparse.Namespace) -> int:
         f"FORCE visualization {result.status}{duplicate}"
         f"  ndvi={result.ndvi_path}"
         f"  quicklook={result.quicklook_path}"
+        f"  debug_plot={result.debug_plot_path}"
         f"  size={result.width}x{result.height}"
         f"  valid_percent={result.valid_percent}"
         f"  manifest={result.manifest_path}"
@@ -1405,6 +1408,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=1400,
         metavar="PX",
         help="Maximum PNG width (default: 1400)",
+    )
+    force_visualize_p.add_argument(
+        "--debug-plot-width",
+        type=int,
+        default=1800,
+        metavar="PX",
+        help="Width of the before/after quality-mask plot (default: 1800)",
+    )
+    force_visualize_p.add_argument(
+        "--no-debug-plot",
+        action="store_true",
+        help="Do not create the raw-versus-masked NDVI diagnostic plot",
     )
     force_visualize_p.add_argument(
         "--overwrite",

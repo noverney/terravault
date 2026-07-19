@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ from terravault.force_visualization import (
 
 GDAL_COMMANDS = ("gdal_create", "gdal_calc.py", "gdal_translate", "gdaldem", "gdalinfo")
 HAS_GDAL = all(shutil.which(command) for command in GDAL_COMMANDS)
+HAS_PILLOW = importlib.util.find_spec("PIL") is not None
 
 
 def test_force_visualize_parser_and_log_path(tmp_path):
@@ -34,6 +36,8 @@ def test_force_visualize_parser_and_log_path(tmp_path):
 
     assert args.cloud_threshold == 35
     assert args.quicklook_width == 1400
+    assert args.debug_plot_width == 1800
+    assert not args.no_debug_plot
     assert _default_log_file(args) == (
         output_dir / "_terravault/logs/force-visualize.log"
     )
@@ -50,9 +54,17 @@ def test_force_visualization_config_validation(tmp_path):
             input_path=tmp_path / "mosaic.vrt",
             red_band=0,
         )
+    with pytest.raises(ValueError, match="at least 640"):
+        ForceVisualizationConfig(
+            input_path=tmp_path / "mosaic.vrt",
+            debug_plot_width=639,
+        )
 
 
-@pytest.mark.skipif(not HAS_GDAL, reason="GDAL command-line tools are not installed")
+@pytest.mark.skipif(
+    not HAS_GDAL or not HAS_PILLOW,
+    reason="GDAL command-line tools and Pillow are required",
+)
 def test_force_visualizer_writes_ndvi_cog_png_manifest_and_skips(tmp_path):
     source = tmp_path / "force-feature.tif"
     subprocess.run(
@@ -94,6 +106,7 @@ def test_force_visualizer_writes_ndvi_cog_png_manifest_and_skips(tmp_path):
         input_path=source,
         output_dir=tmp_path / "visualizations",
         quicklook_width=64,
+        debug_plot_width=640,
     )
 
     result = ForceVisualizer(config).run()
@@ -104,11 +117,23 @@ def test_force_visualizer_writes_ndvi_cog_png_manifest_and_skips(tmp_path):
     assert result.valid_percent == 100
     assert result.ndvi_path.is_file()
     assert result.quicklook_path.is_file()
+    assert result.debug_plot_path is not None
+    assert result.debug_plot_path.is_file()
     assert result.worldfile_path.is_file()
+    assert result.raw_valid_percent == 100
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
     assert manifest["bands"] == {"red": 1, "nir": 2, "scl": 3, "cloud": 4}
     assert manifest["mask_quality"]
+    assert manifest["debug_plot_path"] == str(result.debug_plot_path)
+    assert manifest["raw_valid_percent"] == 100
+    assert manifest["masked_percentage_points"] == 0
     assert manifest["statistics"]["STATISTICS_MINIMUM"] == "0.5"
+    from PIL import Image
+
+    with Image.open(result.debug_plot_path) as debug_plot:
+        assert debug_plot.width == 640
+        assert debug_plot.height > 300
     info = json.loads(
         subprocess.run(
             [shutil.which("gdalinfo") or "gdalinfo", "-json", str(result.ndvi_path)],

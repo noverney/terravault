@@ -188,13 +188,24 @@ Default outputs are written under `FORCE_ROOT/visualizations/`:
 FEATURE_ndvi.tif
 FEATURE_ndvi.png
 FEATURE_ndvi.wld
+FEATURE_ndvi_before_after.png
 FEATURE_ndvi.visualization.json
 _terravault/logs/force-visualize.log
 ```
 
 The GeoTIFF is a georeferenced Float32 COG with `-9999` nodata. The PNG is a
 compact RGBA color relief, and its world file retains map placement. By
-default, the calculation:
+default, `FEATURE_ndvi_before_after.png` places raw B04/B08 NDVI beside the
+quality-masked result on the same NDVI color scale. It labels valid-pixel
+percentages and the percentage points removed by the mask, making cloud and
+classification behavior immediately visible during debugging. This
+comparison is a presentation image, not a georeferenced raster; use the COG
+or the PNG/world-file pair for spatial work.
+
+Install the small plotting dependency with
+`pip install "terravault[visualization]"`. Use `--no-debug-plot` to omit the
+comparison, or `--debug-plot-width` to control its total width. By default,
+the calculation:
 
 - uses band descriptions to locate B04, B08, SCL and CLD;
 - masks SCL 0, 1, 3, 8, 9, 10 and 11;
