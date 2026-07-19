@@ -7,6 +7,7 @@ __all__ = [
     "ExtractionConfig",
     "ExtractionResult",
     "FORCE_DOCKER_IMAGE",
+    "FORCE_DOCKER_PLATFORM",
     "FORCE_VERSION",
     "ForceConfig",
     "ForcePostprocessor",
@@ -62,6 +63,7 @@ def __getattr__(name: str):
         }[name]
     if name in {
         "FORCE_DOCKER_IMAGE",
+        "FORCE_DOCKER_PLATFORM",
         "FORCE_VERSION",
         "ForceConfig",
         "ForcePostprocessor",
@@ -69,6 +71,7 @@ def __getattr__(name: str):
     }:
         from .force import (
             FORCE_DOCKER_IMAGE,
+            FORCE_DOCKER_PLATFORM,
             FORCE_VERSION,
             ForceConfig,
             ForcePostprocessor,
@@ -77,6 +80,7 @@ def __getattr__(name: str):
 
         return {
             "FORCE_DOCKER_IMAGE": FORCE_DOCKER_IMAGE,
+            "FORCE_DOCKER_PLATFORM": FORCE_DOCKER_PLATFORM,
             "FORCE_VERSION": FORCE_VERSION,
             "ForceConfig": ForceConfig,
             "ForcePostprocessor": ForcePostprocessor,

@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 FORCE_VERSION = "3.10.04"
 FORCE_DOCKER_IMAGE = f"davidfrantz/force:{FORCE_VERSION}"
+FORCE_DOCKER_PLATFORM = "linux/amd64"
 _BASENAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _FORCE_DTYPES = frozenset({"Byte", "Int16"})
 _FORCE_DTYPE_LIMITS = {
@@ -70,6 +72,7 @@ class ForceConfig:
     basename: str | None = None
     runtime: str = "auto"
     docker_image: str = FORCE_DOCKER_IMAGE
+    docker_platform: str | None = FORCE_DOCKER_PLATFORM
     mount_root: Path | None = None
     target_crs: str = "EPSG:2056"
     origin_lon: float = 5.5
@@ -99,6 +102,8 @@ class ForceConfig:
             raise ValueError("runtime must be 'auto', 'native' or 'docker'")
         if not self.docker_image.strip():
             raise ValueError("docker_image cannot be empty")
+        if self.docker_platform is not None and not self.docker_platform.strip():
+            raise ValueError("docker_platform cannot be empty; use None to omit it")
         if not (-180 <= self.origin_lon <= 180):
             raise ValueError("origin_lon must be between -180 and 180")
         if not (-90 <= self.origin_lat <= 90):
@@ -180,7 +185,7 @@ class ForcePostprocessor:
         if self._runtime is not None:
             return self._runtime
         if self.config.runtime == "auto":
-            native = all(
+            native = platform.system() == "Linux" and all(
                 shutil.which(command)
                 for command in (
                     "force-info",
@@ -253,15 +258,21 @@ class ForcePostprocessor:
             "docker",
             "run",
             "--rm",
-            "--volume",
-            f"{mount_root}:/data",
-            "--env",
-            "HOME=/tmp",
-            "--env",
-            "PARALLEL_HOME=/tmp/.parallel",
-            "--env",
-            "SHELL=/bin/bash",
         ]
+        if self.config.docker_platform is not None:
+            command.extend(["--platform", self.config.docker_platform])
+        command.extend(
+            [
+                "--volume",
+                f"{mount_root}:/data",
+                "--env",
+                "HOME=/tmp",
+                "--env",
+                "PARALLEL_HOME=/tmp/.parallel",
+                "--env",
+                "SHELL=/bin/bash",
+            ]
+        )
         if hasattr(os, "getuid") and hasattr(os, "getgid"):
             command.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
         command.extend([self.config.docker_image, executable, *arguments])
@@ -460,6 +471,7 @@ class ForcePostprocessor:
             "force_version": FORCE_VERSION,
             "force_info": force_info,
             "docker_image": self.config.docker_image,
+            "docker_platform": self.config.docker_platform,
             "input_path": str(self.config.input_path),
             "input_bytes": (
                 self.config.input_path.stat().st_size

@@ -281,7 +281,9 @@ first with `--dry-run`; GDAL does the pixel work block by block under
 FORCE is pinned as the `vendor/force` Git submodule. TerraVault imports its
 stitched L2A band products through FORCE's supported external-feature
 datacube path; it does not mislabel selected L2A bands as FORCE Level-2 ARD.
-Docker is the default portable runtime.
+Docker is the default portable runtime. FORCE is Linux software; on macOS,
+TerraVault explicitly runs the pinned `linux/amd64` image rather than trying
+to compile or link FORCE against macOS libraries.
 
 Plan the current Swiss-wide 10 m B04/B08/SCL/CLD extraction:
 

@@ -15,6 +15,7 @@ from typing import Any
 
 from terravault import (
     FORCE_DOCKER_IMAGE,
+    FORCE_DOCKER_PLATFORM,
     ExtractionConfig,
     ForceConfig,
     ForcePostprocessor,
@@ -103,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument("--docker-image", default=FORCE_DOCKER_IMAGE)
+    parser.add_argument("--docker-platform", default=FORCE_DOCKER_PLATFORM)
     parser.add_argument(
         "--mount-root",
         type=Path,
@@ -269,6 +271,7 @@ def main() -> int:
             basename=basename,
             runtime=args.runtime,
             docker_image=args.docker_image,
+            docker_platform=args.docker_platform,
             mount_root=args.mount_root,
             target_crs=args.target_crs,
             resolution=args.resolution,

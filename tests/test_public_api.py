@@ -47,6 +47,7 @@ def test_local_dataset_query_and_extraction_imports_are_public():
 def test_force_postprocessing_imports_are_public():
     from terravault import (
         FORCE_DOCKER_IMAGE,
+        FORCE_DOCKER_PLATFORM,
         FORCE_VERSION,
         ForceConfig,
         ForcePostprocessor,
@@ -55,6 +56,7 @@ def test_force_postprocessing_imports_are_public():
 
     assert FORCE_VERSION == "3.10.04"
     assert FORCE_DOCKER_IMAGE == "davidfrantz/force:3.10.04"
+    assert FORCE_DOCKER_PLATFORM == "linux/amd64"
     assert ForceConfig is not None
     assert ForcePostprocessor is not None
     assert ForceResult is not None

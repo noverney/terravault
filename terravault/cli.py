@@ -425,6 +425,7 @@ def cmd_force(args: argparse.Namespace) -> int:
                 basename=args.basename,
                 runtime=args.runtime,
                 docker_image=args.docker_image,
+                docker_platform=args.docker_platform,
                 mount_root=None if args.mount_root is None else Path(args.mount_root),
                 target_crs=args.target_crs,
                 origin_lon=args.origin_lon,
@@ -1163,7 +1164,7 @@ def build_parser() -> argparse.ArgumentParser:
     extract_p.set_defaults(func=cmd_extract)
 
     # ---------------------------------------------------------------- force
-    from .force import FORCE_DOCKER_IMAGE
+    from .force import FORCE_DOCKER_IMAGE, FORCE_DOCKER_PLATFORM
 
     force_p = sub.add_parser(
         "force",
@@ -1197,13 +1198,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--runtime",
         choices=("auto", "native", "docker"),
         default="auto",
-        help="FORCE runtime; auto prefers native commands, then Docker",
+        help="FORCE runtime; auto uses native only on Linux, otherwise Docker",
     )
     force_p.add_argument(
         "--docker-image",
         default=FORCE_DOCKER_IMAGE,
         metavar="IMAGE",
         help=f"Pinned FORCE container image (default: {FORCE_DOCKER_IMAGE})",
+    )
+    force_p.add_argument(
+        "--docker-platform",
+        default=FORCE_DOCKER_PLATFORM,
+        metavar="PLATFORM",
+        help=f"Pinned FORCE container platform (default: {FORCE_DOCKER_PLATFORM})",
     )
     force_p.add_argument(
         "--mount-root",

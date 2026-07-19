@@ -67,18 +67,29 @@ the pinned gitlink remains unchanged. Do not commit replacements inside
 Docker is the recommended route:
 
 ```bash
-docker pull davidfrantz/force:3.10.04
-docker run --rm davidfrantz/force:3.10.04 force-info
+docker pull --platform linux/amd64 davidfrantz/force:3.10.04
+docker run --rm --platform linux/amd64 davidfrantz/force:3.10.04 force-info
 ```
 
-`--runtime auto` uses a complete native FORCE install when all required
-commands exist and otherwise uses Docker. Select explicitly with
-`--runtime native` or `--runtime docker`. Docker commands mount only the
-smallest common parent containing the input and output, map the host user to
-avoid root-owned products, and use a writable temporary home for FORCE's GNU
-Parallel workers. TerraVault also pins `SHELL=/bin/bash`; otherwise an
-unlisted host UID can make GNU Parallel fall back to `/bin/sh`, which cannot
-execute FORCE's exported Bash tile worker.
+FORCE is developed and tested on Ubuntu; upstream does not support migrating
+it to other operating systems. `--runtime auto` therefore considers a native
+FORCE installation only on Linux. On macOS it always selects Docker, even if
+commands named `force-*` happen to be on `PATH`. An explicit `--runtime
+native` remains available for developers deliberately testing a port.
+
+The official v3.10.04 image used here is `linux/amd64`. On this Apple Silicon
+Mac, Docker Desktop runs it through Linux/AMD64 emulation; FORCE itself never
+links against macOS ARM64 libraries. The real Zurich integration test
+successfully ran this exact combination. It will generally be slower than
+native AMD64 Linux for a national job.
+
+Docker commands pin `--platform linux/amd64`, mount only the smallest common
+parent containing the input and output, map the host user to avoid root-owned
+products, and use a writable temporary home for FORCE's GNU Parallel workers.
+TerraVault also pins `SHELL=/bin/bash`; otherwise an unlisted host UID can
+make GNU Parallel fall back to `/bin/sh`, which cannot execute FORCE's
+exported Bash tile worker. Override `--docker-platform` only when using a
+tested custom/multi-architecture image.
 
 FORCE can also be compiled natively on a supported Linux system by following
 its installation documentation. TerraVault checks for `force-info`,
@@ -225,3 +236,25 @@ layout. If the goal is a true FORCE BOA/QAI time-series archive, change the
 acquisition workflow to retain complete Sentinel-2 Level-1 products and run
 `force-level2`; the selected TerraVault L2A band archive cannot substitute
 for those inputs.
+
+## When a FORCE fork is warranted
+
+No upstream FORCE source has been modified by this integration. The macOS
+handling, WKT normalization, container environment and child-output checks
+live in TerraVault's wrapper, while the submodule still points to
+`davidfrantz/force`.
+
+Create a fork only when a required fix belongs inside FORCE itself—for
+example, a multi-architecture Dockerfile, a portable replacement for a
+Linux-only dependency, or an accepted change to `force-cube`. At that point:
+
+1. fork `davidfrantz/force` under the project/user GitHub account;
+2. create a versioned branch such as `terravault-v3.10.04`;
+3. add tests and retain the upstream remote for rebasing;
+4. change `.gitmodules` to the fork URL and pin an exact tested commit;
+5. build a versioned image such as `PROJECT/force:3.10.04-terravault.1`;
+6. update `FORCE_DOCKER_IMAGE`, `FORCE_DOCKER_PLATFORM` and the integration
+   tests together.
+
+Do not point the submodule at an unpinned development branch. This keeps the
+scientific runtime and its provenance reproducible.

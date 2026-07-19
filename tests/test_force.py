@@ -11,6 +11,7 @@ import pytest
 from terravault.cli import _default_log_file, build_parser
 from terravault.force import (
     FORCE_DOCKER_IMAGE,
+    FORCE_DOCKER_PLATFORM,
     FORCE_VERSION,
     ForceConfig,
     ForcePostprocessor,
@@ -204,8 +205,29 @@ def test_force_docker_command_uses_scoped_mount_user_and_writable_home(
     assert "HOME=/tmp" in command
     assert "PARALLEL_HOME=/tmp/.parallel" in command
     assert "SHELL=/bin/bash" in command
+    assert command[3:5] == ["--platform", FORCE_DOCKER_PLATFORM]
     assert "--user" in command
     assert FORCE_DOCKER_IMAGE in command
+
+
+def test_force_auto_never_selects_unsupported_native_macos(tmp_path, monkeypatch):
+    input_path = tmp_path / "input.tif"
+    input_path.write_bytes(b"raster")
+    processor = ForcePostprocessor(
+        ForceConfig(
+            input_path=input_path,
+            output_root=tmp_path / "force",
+            runtime="auto",
+            dry_run=True,
+        )
+    )
+    monkeypatch.setattr("terravault.force.platform.system", lambda: "Darwin")
+    monkeypatch.setattr(
+        "terravault.force.shutil.which",
+        lambda command: f"/usr/bin/{command}",
+    )
+
+    assert processor._select_runtime() == "docker"
 
 
 def test_force_cli_parser_and_default_log(tmp_path):
@@ -223,6 +245,7 @@ def test_force_cli_parser_and_default_log(tmp_path):
     )
 
     assert args.runtime == "docker"
+    assert args.docker_platform == FORCE_DOCKER_PLATFORM
     assert args.resolution == 10
     assert args.output_dtype == "Int16"
     assert _default_log_file(args) == tmp_path / "force/_terravault/logs/force.log"
