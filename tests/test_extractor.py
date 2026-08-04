@@ -90,7 +90,14 @@ def _index_raster(
             path.resolve().as_uri(),
             media_type="image/tiff; application=geotiff",
             roles=["data"],
-            extra_fields={"proj:epsg": 4326, "gsd": 10},
+            extra_fields={
+                "proj:epsg": 4326,
+                "gsd": 10,
+                "nodata": 0,
+                "data_type": "uint16",
+                "raster:scale": 0.0001,
+                "raster:offset": -0.1,
+            },
         ),
     )
     catalog.upsert_item(
@@ -130,6 +137,117 @@ def test_dtype_promotion_preserves_mixed_integer_ranges():
     assert _promote_dtype(["Int16", "UInt16"]) == "Int32"
     assert _promote_dtype(["Int32", "UInt32"]) == "Float64"
     assert _promote_dtype(["Float32", "UInt16"]) == "Float32"
+
+
+@pytest.mark.skipif(not HAS_GDAL, reason="GDAL command-line tools are not installed")
+def test_extractor_band_contract_reserves_valid_cloud_probability_zero(tmp_path):
+    extractor = RasterExtractor(
+        ExtractionConfig(
+            dataset_db=tmp_path / "dataset.duckdb",
+            bbox=(8.0, 46.9, 8.1, 47.0),
+            asset_keys=("B04_10m", "CLD_20m"),
+            output_path=tmp_path / "mixed.tif",
+        )
+    )
+    pieces = [
+        {
+            "asset_key": "B04_10m",
+            "nodata": "0",
+            "data_type": "uint16",
+            "raster_dtype": "UInt16",
+            "raster_scale": 0.0001,
+            "raster_offset": -0.1,
+        },
+        {
+            "asset_key": "CLD_20m",
+            "nodata": None,
+            "data_type": "uint8",
+            "raster_dtype": "Byte",
+            "raster_scale": None,
+            "raster_offset": None,
+        },
+    ]
+
+    nodata, working_dtype = extractor._destination_nodata(pieces)
+    contract = extractor._band_contract(pieces, destination_nodata=nodata)
+
+    assert nodata == "-9999"
+    assert working_dtype == "Int32"
+    assert contract["bands"][1]["zero_is_valid"] is True
+    assert contract["bands"][1]["output_nodata"] == -9999
+
+
+@pytest.mark.skipif(not HAS_GDAL, reason="GDAL command-line tools are not installed")
+def test_destination_nodata_does_not_truncate_floating_sources(tmp_path):
+    extractor = RasterExtractor(
+        ExtractionConfig(
+            dataset_db=tmp_path / "dataset.duckdb",
+            bbox=(8.0, 46.9, 8.1, 47.0),
+            asset_keys=("NDVI",),
+            output_path=tmp_path / "ndvi.tif",
+            nodata="-9999",
+        )
+    )
+
+    nodata, working_dtype = extractor._destination_nodata(
+        [
+            {
+                "asset_key": "NDVI",
+                "nodata": "-9999",
+                "data_type": "float32",
+                "raster_dtype": "Float32",
+            }
+        ]
+    )
+
+    assert nodata == "-9999"
+    assert working_dtype is None
+
+
+def test_warp_feature_maps_source_nodata_but_preserves_valid_zero(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        RasterExtractor,
+        "_locate_gdal",
+        staticmethod(
+            lambda: {
+                "gdalwarp": "gdalwarp",
+                "gdalbuildvrt": "gdalbuildvrt",
+                "gdal_translate": "gdal_translate",
+                "gdalinfo": "gdalinfo",
+            }
+        ),
+    )
+    extractor = RasterExtractor(
+        ExtractionConfig(
+            dataset_db=tmp_path / "dataset.duckdb",
+            bbox=(8.0, 46.9, 8.1, 47.0),
+            asset_keys=("B04_10m",),
+            output_path=tmp_path / "mixed.tif",
+        )
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        extractor,
+        "_run_command",
+        lambda command: commands.append(list(command)),
+    )
+
+    extractor._warp_feature(
+        asset_key="B04_10m",
+        sources=(
+            {"local_path": tmp_path / "red.jp2", "nodata": 0},
+            {"local_path": tmp_path / "cloud-probability.jp2", "nodata": None},
+        ),
+        target_crs="EPSG:2056",
+        resolution=10,
+        destination_nodata="-9999",
+        working_dtype="Int32",
+        output_vrt=tmp_path / "feature.vrt",
+    )
+
+    red_warp, cloud_warp = commands[:2]
+    assert red_warp[red_warp.index("-srcnodata") + 1] == "0"
+    assert "-srcnodata" not in cloud_warp
 
 
 def test_extract_parser_requires_region_features_and_output():
@@ -229,7 +347,12 @@ def test_extractor_selects_latest_per_tile_and_streams_cog(tmp_path):
     assert result.output_dtype == "UInt16"
     assert output.is_file()
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
     assert manifest["asset_keys_in_band_order"] == ["B04_10m"]
+    assert manifest["band_contract"]["storage"] == "raw"
+    assert manifest["band_contract"]["bands"][0]["scale"] == 0.0001
+    assert manifest["band_contract"]["bands"][0]["offset"] == -0.1
+    assert manifest["sources"][0]["raster_scale"] == 0.0001
     assert {source["item_id"] for source in manifest["sources"]} == {
         "new-left",
         "right",
@@ -245,6 +368,9 @@ def test_extractor_selects_latest_per_tile_and_streams_cog(tmp_path):
     )
     assert info["metadata"]["IMAGE_STRUCTURE"]["LAYOUT"] == "COG"
     assert info["bands"][0]["description"] == "B04_10m"
+    assert info["bands"][0]["scale"] == 0.0001
+    assert info["bands"][0]["offset"] == -0.1
+    assert json.loads(info["metadata"][""]["TERRAVAULT_BAND_CONTRACT"])["storage"] == "raw"
     assert info["bands"][0]["metadata"][""]["STATISTICS_MINIMUM"] == "10"
     assert info["bands"][0]["metadata"][""]["STATISTICS_MAXIMUM"] == "20"
 

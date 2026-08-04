@@ -5,9 +5,10 @@
 TerraVault is a lightweight Python toolkit that connects to any STAC-compliant catalog, discovers new satellite scenes for a configurable area of interest, persists their metadata locally, and downloads the assets you need — all while keeping track of what has already been ingested so each run processes only *new* data.
 
 CDSE note: there is no single interchangeable "API key" for these workflows.
-Native product ingestion uses S3 access/secret keys, while Sentinel Hub
-processing uses an OAuth client ID/secret to obtain short-lived API access
-tokens. See [Copernicus credentials](#copernicus-credentials) below.
+Native ingestion normally uses S3 access/secret keys; a complete Product ZIP
+can instead use a current CDSE bearer/account login; Sentinel Hub processing
+uses its own OAuth client ID/secret. See
+[Copernicus credentials](#copernicus-credentials) below.
 
 ---
 
@@ -26,8 +27,8 @@ tokens. See [Copernicus credentials](#copernicus-credentials) below.
 | **Restartable rolling ingest** | Native CDSE S3 assets, per-asset SQLite queue, resumable transfers and failure sidecars |
 | **DuckDB dataset catalogue** | Top-level spatial/time index for every partitioned local raster piece |
 | **Memory-bounded raster extraction** | Query intersecting pieces and stream one aligned multiband COG through GDAL |
-| **FORCE postprocessing** | Pinned FORCE submodule, Docker/native bridge, restartable feature-cube imports and mosaics |
-| **FORCE visualization** | Quality-masked NDVI COGs and georeferenced color PNG quicklooks |
+| **FORCE postprocessing** | Version-checked FORCE runtime, honest L2A bridge, and isolated per-SAFE L1C → BOA/QAI processing |
+| **FORCE visualization** | Georeferenced NDVI outputs plus raw/CDSE/FORCE-QAI mask comparisons |
 | **Operational logs** | Automatic rotating progress, storage, retry, quota and completion logs |
 | **Explicit ROI** | Rolling discovery accepts a WGS84 bbox or Polygon/MultiPolygon GeoJSON |
 | **Historical backfill** | Windowed progress, durable cursor, quota waits and retired jobs |
@@ -85,13 +86,14 @@ pip install "terravault[dev]"       # adds pytest + responses for development
 
 ## Copernicus credentials
 
-TerraVault supports two separate Copernicus Data Space Ecosystem (CDSE)
-access routes. Create the credential that matches the command you intend to
-run; the two credential pairs are not interchangeable.
+TerraVault supports three separate Copernicus Data Space Ecosystem (CDSE)
+authentication routes. Create the credential that matches the command you
+intend to run; they are not interchangeable.
 
 | Credential | Create it here | Used for |
 |---|---|---|
-| **S3 access key + secret key** | [CDSE S3 Credentials Manager](https://eodata-s3keysmanager.dataspace.copernicus.eu/panel/s3-credentials) | `terravault watch` and `terravault historic`; downloads original native-resolution Sentinel files into the local partitioned dataset |
+| **S3 access key + secret key** | [CDSE S3 Credentials Manager](https://eodata-s3keysmanager.dataspace.copernicus.eu/panel/s3-credentials) | `terravault watch`, `terravault historic`, and the preferred `force-level2 --stac-item` route; downloads native assets or a complete SAFE tree |
+| **CDSE product-download bearer/account** | A current CDSE bearer token, or CDSE username/password with optional TOTP | Fallback `force-level2 --stac-item` download of the STAC `Product` ZIP and authenticated catalogue/product downloads |
 | **Sentinel Hub OAuth client ID + client secret** | [CDSE Dashboard → User Settings → OAuth clients](https://shapps.dataspace.copernicus.eu/dashboard/#/account/settings) | Process API examples such as `fetch_raw_patch.py` and `fetch_switzerland_snapshot.py`; requests server-side subsets, reprojection, mosaicking or derived products |
 
 For native S3 ingestion, sign in to the S3 Credentials Manager, choose
@@ -117,11 +119,28 @@ keep `.env` private and never commit real credentials. TerraVault exchanges
 the Sentinel Hub client credentials for a short-lived bearer access token
 automatically; do not paste that bearer token into the S3 fields.
 
-Neither credential is intrinsically faster because it selects a different
-data path:
+For a complete L1C `Product` ZIP fallback, configure either a current bearer
+token or the account flow:
+
+```dotenv
+# Short-lived; replace it when CDSE expires it.
+TERRAVAULT_CDSE_ACCESS_TOKEN=your_current_cdse_bearer_token
+
+# Or let TerraVault request a token through the public client.
+# TERRAVAULT_CDSE_USERNAME=your_cdse_username
+# TERRAVAULT_CDSE_PASSWORD=your_cdse_password
+# TERRAVAULT_CDSE_TOTP=123456
+```
+
+The Sentinel Hub client ID/secret from the dashboard is not a CDSE S3 key and
+is not used to authenticate a STAC `Product` ZIP.
+
+No credential is intrinsically faster; each selects a different data path:
 
 - S3 is normally the appropriate high-throughput route for rolling or
   historical downloads of complete, original products and native bands.
+- The authenticated `Product` asset transfers one complete SAFE ZIP and is a
+  useful fallback when the STAC item has no usable S3 manifest route.
 - Sentinel Hub can be quicker and transfer much less data for a small area,
   a few bands or a server-computed result, but processing-unit quotas apply.
 
@@ -272,19 +291,35 @@ terravault extract \
 ```
 
 The output is a tiled Cloud Optimized GeoTIFF plus a manifest recording every
-source and the feature-to-band mapping. Country-scale requests can be inspected
-first with `--dry-run`; GDAL does the pixel work block by block under
-`--warp-memory-mib`. See
+source, the feature-to-band mapping, source nodata, and each band's raw-storage
+scale/offset contract. If valid cloud probability zero would collide with the
+default output nodata zero, extraction automatically uses a signed `-9999`
+sentinel and maps reflectance source nodata explicitly. Country-scale requests
+can be inspected first with `--dry-run`; GDAL does the pixel work block by
+block under `--warp-memory-mib`. See
 [`docs/RASTER_QUERY_AND_EXTRACTION.md`](docs/RASTER_QUERY_AND_EXTRACTION.md).
 
 ### FORCE postprocessing
 
-FORCE is pinned as the `vendor/force` Git submodule. TerraVault imports its
-stitched L2A band products through FORCE's supported external-feature
-datacube path; it does not mislabel selected L2A bands as FORCE Level-2 ARD.
+FORCE is pinned as the `vendor/force` Git submodule. TerraVault exposes two
+separate workflows:
+
+1. `terravault force` imports a stitched, already processed L2A raster into a
+   FORCE external-feature cube. It does not create BOA/QAI.
+2. `terravault force-level2` gives one complete Sentinel-2 L1C SAFE product to
+   native FORCE L2PS, which performs atmospheric correction and creates real
+   BOA and bit-packed QAI products.
+
+Selected L2A JP2 files, a four-band L2A COG, and Process API exports are not
+valid L2PS inputs. A local input must be a complete
+`S2*_MSIL1C_*.SAFE` directory or correctly rooted `.SAFE.zip`, including
+product/granule metadata and every L1C band (including B10).
+
 Docker is the default portable runtime. FORCE is Linux software; on macOS,
-TerraVault explicitly runs the pinned `linux/amd64` image rather than trying
-to compile or link FORCE against macOS libraries.
+TerraVault runs the version-tagged `linux/amd64` image and verifies the
+reported FORCE version rather than compiling or linking FORCE against macOS
+libraries. A Docker tag is mutable; use an image digest or controlled registry
+when byte-for-byte runtime identity is required.
 
 Plan the current Swiss-wide 10 m B04/B08/SCL/CLD extraction:
 
@@ -304,6 +339,83 @@ commands, chips and mosaics are persisted, so an interrupted or repeated job
 can be safely rerun. See
 [`docs/FORCE_POSTPROCESSING.md`](docs/FORCE_POSTPROCESSING.md).
 
+Run genuine FORCE cloud/atmospheric processing on a complete local L1C SAFE:
+
+On Apple Silicon, first build the package's native Linux ARM64 runtime (this
+avoids the official image's AMD64/QEMU emulation):
+
+```bash
+docker build --platform linux/arm64 \
+  -f docker/force-arm64.Dockerfile \
+  -t terravault/force:3.10.04-arm64 .
+```
+
+```bash
+python examples/postprocessing/force_level2.py \
+  --input /data/l1c/S2B_MSIL1C_20260717T103029_N0512_R108_T32TMT_20260717T142404.SAFE.zip \
+  --output-root /data/terravault/force-native \
+  --runtime docker \
+  --dem /data/dem/switzerland_dem.tif
+```
+
+Or provide a saved Sentinel-2 L1C STAC Item. TerraVault prefers the item's
+`safe_manifest` S3 prefix when S3 keys are configured; otherwise it can resume
+the authenticated `Product` ZIP using CDSE product-download credentials:
+
+```bash
+terravault force-level2 \
+  --stac-item /data/stac/S2A_MSIL1C_item.json \
+  --output-root /data/terravault/force-native \
+  --runtime docker \
+  --dem /data/dem/switzerland_dem.tif
+```
+
+Swiss defaults are EPSG:2056, 10 m pixels, 30 km tiles, and a stable grid
+origin at 5.5° E / 48° N. A DEM is strongly recommended: without one FORCE
+continues with topographic correction disabled and reduced atmospheric and
+cloud-shadow quality.
+
+Each SAFE is published independently below
+`OUTPUT_ROOT/level2/products/SAFE_STEM/`, including its own BOA/QAI chips and
+mosaic VRTs plus per-tile OVV JPEG quicklooks. Different SAFE products from
+the same date remain separate; this command does not build a pooled acquisition
+or Switzerland-wide FORCE mosaic. Processing first uses a per-SAFE attempt
+directory and publishes atomically only after the cube definition, CRS/grid,
+BOA/QAI/OVV chips, and both VRT source sets verify. A retry discards only that
+SAFE's incomplete processing attempt.
+The shared `_terravault/force-l2/cube.json` fixes the grid for the output root,
+so use a new root to change CRS, origin, tile size, or resolution.
+
+S3 SAFE trees are assembled below a hidden per-product staging directory.
+TerraVault verifies the exact object list, byte sizes, complete SAFE structure,
+and a SHA-256 for every local object before swapping the staged directory into
+`level1/`. The prior verified SAFE remains published during a retry; legacy
+download manifests without content hashes are rebuilt once instead of being
+trusted from sizes alone.
+
+`force-level2` is the restartable per-product primitive. It is not yet wired
+into `watch` or `historic` as an active Swiss L1C/FORCE scheduler.
+`--download-max-retries` controls complete-product attempts; CDSE
+`Retry-After` values are honoured between attempts (with a configurable
+15-minute fallback). Ctrl-C and SIGTERM terminate the active native process
+group, record an interrupted download/job, and leave staged state that the same
+command can resume.
+
+Inspect honest progress from another terminal:
+
+```bash
+terravault force-status \
+  --output-root /data/terravault/force-native \
+  --job S2B_MSIL1C_20260717T103029_N0512_R108_T32TMT_20260717T140459
+```
+
+The command reports phase, elapsed time, live queue state, BOA/QAI/OVV tile
+counts, bytes written, and manifest/log paths. New runs also update
+`_terravault/force-l2/progress/SAFE_STEM.json` and log the same heartbeat every
+30 seconds. FORCE exposes no reliable within-scene pixel percentage, so that
+field remains unavailable instead of presenting GNU Parallel's misleading
+single-scene ETA.
+
 Turn a FORCE B04/B08/SCL/CLD mosaic into a viewable NDVI product:
 
 ```bash
@@ -317,6 +429,27 @@ provenance manifest under the FORCE root's `visualizations/` directory. It
 also creates a labelled `*_before_after.png` diagnostic using the same color
 scale: raw B04/B08 NDVI on the left and the SCL/CLD-masked result on the
 right.
+
+After native L2PS has produced a matching QAI mosaic, request the three-panel
+diagnostic:
+
+```bash
+terravault force-visualize \
+  --input FORCE_EXTERNAL_ROOT/datacube/mosaic/FEATURE.vrt \
+  --force-qai FORCE_NATIVE_ROOT/level2/products/SAFE_STEM/mosaic/YYYYMMDD_LEVEL2_SEN2A_QAI.vrt
+```
+
+This writes `*_raw_cdse_force.png`: raw NDVI, CDSE SCL+CLD masking, and FORCE
+QAI masking side by side. All three use the same L2A B04/B08 reflectance
+pixels after applying their recorded raw-DN scale and offset, so the plot
+isolates mask differences. The default FORCE mask is
+`0x031F` (nodata, all cloud states, shadow, snow, subzero, and saturation).
+The native BOA raster is deliberately not substituted into the third panel.
+
+No successful real Zurich L1C→L2PS execution is claimed yet. In the latest
+2026-08-04 preflight, CDSE rejected the configured S3 pair with
+`InvalidAccessKeyId`, and no Product bearer/account fallback was configured.
+The existing Zurich FORCE output demonstrates the external-feature bridge only.
 
 ### Historical backfill
 
@@ -347,6 +480,7 @@ Commands:
   query        Query local georeferenced raster pieces from dataset DuckDB
   extract      Stream intersecting pieces into one multiband COG
   force        Import a stitched raster into a FORCE feature datacube
+  force-level2 Run native FORCE L2PS on a complete Sentinel-2 L1C SAFE
   force-visualize  Create an NDVI COG and color quicklook from FORCE
   collections  List collections available in the STAC catalog
 ```
@@ -497,7 +631,7 @@ pytest
 | `tqdm` | Download progress bars |
 | `rasterio` *(optional)* | Raster I/O and COG conversion |
 | GDAL command-line tools | Block-wise VRT reprojection, mosaicking and COG extraction |
-| FORCE v3.10.04 | Tiled external-feature datacubes and VRT mosaics |
+| FORCE v3.10.04 | Tiled external features plus version-checked, per-SAFE native L1C processing into BOA/QAI |
 | `Pillow` *(optional)* | Public-thumbnail country overview |
 | `boto3` *(optional)* | Native CDSE S3 streaming and Range-resume |
 

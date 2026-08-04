@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import platform
+
 
 def test_readme_pipeline_imports_are_public():
     from terravault import CDSEDownloadAuthConfig, Pipeline, PipelineConfig
@@ -55,8 +57,17 @@ def test_force_postprocessing_imports_are_public():
     )
 
     assert FORCE_VERSION == "3.10.04"
-    assert FORCE_DOCKER_IMAGE == "davidfrantz/force:3.10.04"
-    assert FORCE_DOCKER_PLATFORM == "linux/amd64"
+    expected_image = (
+        "terravault/force:3.10.04-arm64"
+        if platform.machine().casefold() in {"arm64", "aarch64"}
+        else "davidfrantz/force:3.10.04"
+    )
+    assert FORCE_DOCKER_IMAGE == expected_image
+    assert FORCE_DOCKER_PLATFORM == (
+        "linux/arm64"
+        if platform.machine().casefold() in {"arm64", "aarch64"}
+        else "linux/amd64"
+    )
     assert ForceConfig is not None
     assert ForcePostprocessor is not None
     assert ForceResult is not None
@@ -72,3 +83,25 @@ def test_force_visualization_imports_are_public():
     assert ForceVisualizationConfig is not None
     assert ForceVisualizationResult is not None
     assert ForceVisualizer is not None
+
+
+def test_native_force_level2_imports_are_public():
+    from terravault import (
+        ForceLevel2Config,
+        ForceLevel2Processor,
+        ForceLevel2Result,
+        ForceLevel2Status,
+        L1CDownloadConfig,
+        L1CDownloadResult,
+        L1CProductDownloader,
+        inspect_force_level2_status,
+    )
+
+    assert ForceLevel2Config is not None
+    assert ForceLevel2Processor is not None
+    assert ForceLevel2Result is not None
+    assert ForceLevel2Status is not None
+    assert inspect_force_level2_status is not None
+    assert L1CDownloadConfig is not None
+    assert L1CDownloadResult is not None
+    assert L1CProductDownloader is not None

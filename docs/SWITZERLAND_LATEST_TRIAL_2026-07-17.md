@@ -3,6 +3,13 @@
 This records the live, reproducible validation run performed against the
 Copernicus Data Space Ecosystem (CDSE) STAC catalogue on 2026-07-17.
 
+This trial covers Sentinel-2 L2A discovery and the local external-feature
+workflow. It does not validate native FORCE L2PS, which requires complete L1C
+SAFE products. No successful real Zurich L1C → BOA/QAI run is claimed from
+these artifacts. A later 2026-08-04 preflight found the configured S3 pair
+rejected with `InvalidAccessKeyId` and no Product bearer/account fallback, so
+the complete L1C download did not start.
+
 ## Command
 
 The discovery/catalog portion used the full Switzerland convenience bounding
@@ -120,3 +127,25 @@ terravault extract \
 Repeat without `--dry-run` after checking the manifest estimate. See
 [RASTER_QUERY_AND_EXTRACTION.md](RASTER_QUERY_AND_EXTRACTION.md) for the
 all-feature command and memory/output-size controls.
+
+## Native ARM64 FORCE L2PS integration result
+
+The retained complete L1C product for MGRS tile `32TMT` was processed with the
+repository-built `terravault/force:3.10.04-arm64` image on Apple Silicon. This
+is a Zurich-area integration fixture, not the 20-product country-wide run.
+
+- FORCE core processing completed in approximately 6.5 minutes, compared with
+  more than 40 minutes without output from the stopped AMD64/QEMU attempt;
+- peak observed use was approximately two CPU cores and 7.6 GiB RAM;
+- FORCE produced and TerraVault validated 25 BOA, 25 QAI, and 25 OVV tiles;
+- validated raster output totaled 2,153,371,382 bytes before VRT publication;
+- the queue reached `DONE`, and BOA/QAI mosaics were published atomically under
+  `satellite_data/switzerland_ndvi/force_native/level2/products/`;
+- the three-panel Zurich diagnostic reported raw, CDSE-masked, and FORCE-masked
+  valid coverage of 99.88%, 94.58%, and 89.74% respectively.
+
+The real run also established two FORCE 3.10.04 output contracts now covered
+by tests: OVV JPEGs are plain RGB quicklooks without embedded georeferencing,
+and ARM64 FORCE metadata can contain non-UTF-8 bytes that must be replaced when
+copied into VRT XML. Raster grids, BOA/QAI metadata, tile coverage, VRT source
+sets, and the original processing logs remain strictly validated.

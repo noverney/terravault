@@ -26,8 +26,20 @@ from typing import Any, Sequence
 logger = logging.getLogger(__name__)
 
 FORCE_VERSION = "3.10.04"
-FORCE_DOCKER_IMAGE = f"davidfrantz/force:{FORCE_VERSION}"
-FORCE_DOCKER_PLATFORM = "linux/amd64"
+_ARM64_MACHINES = frozenset({"arm64", "aarch64"})
+_HOST_IS_ARM64 = platform.machine().casefold() in _ARM64_MACHINES
+FORCE_DOCKER_IMAGE = os.environ.get(
+    "TERRAVAULT_FORCE_DOCKER_IMAGE",
+    (
+        f"terravault/force:{FORCE_VERSION}-arm64"
+        if _HOST_IS_ARM64
+        else f"davidfrantz/force:{FORCE_VERSION}"
+    ),
+)
+FORCE_DOCKER_PLATFORM = os.environ.get(
+    "TERRAVAULT_FORCE_DOCKER_PLATFORM",
+    "linux/arm64" if _HOST_IS_ARM64 else "linux/amd64",
+)
 _BASENAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _FORCE_DTYPES = frozenset({"Byte", "Int16"})
 _FORCE_DTYPE_LIMITS = {
@@ -168,6 +180,8 @@ class ForcePostprocessor:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if completed.stdout.strip():
             logger.debug("Command stdout: %s", completed.stdout.strip())

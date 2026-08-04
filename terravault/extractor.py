@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -38,6 +39,28 @@ _GDAL_TO_BYTES = {
     "Float64": 8,
 }
 _OUTPUT_DTYPES = frozenset(_GDAL_TO_BYTES)
+_INTEGER_RANGES = {
+    "Byte": (0, 255),
+    "Int8": (-128, 127),
+    "UInt16": (0, 65535),
+    "Int16": (-32768, 32767),
+    "UInt32": (0, 4294967295),
+    "Int32": (-2147483648, 2147483647),
+    "UInt64": (0, 18446744073709551615),
+    "Int64": (-9223372036854775808, 9223372036854775807),
+}
+_STAC_TO_GDAL_DTYPE = {
+    "uint8": "Byte",
+    "int8": "Int8",
+    "uint16": "UInt16",
+    "int16": "Int16",
+    "uint32": "UInt32",
+    "int32": "Int32",
+    "uint64": "UInt64",
+    "int64": "Int64",
+    "float32": "Float32",
+    "float64": "Float64",
+}
 _RESAMPLING = frozenset(
     {
         "near",
@@ -99,6 +122,54 @@ def _promote_dtype(dtypes: Iterable[str]) -> str:
     if "Int8" in unique:
         return "Int16" if "Byte" in unique else "Int8"
     return "Byte"
+
+
+def _json_number(value: Any) -> int | float | None:
+    """Normalize catalogue numeric strings for durable JSON provenance."""
+
+    if value is None:
+        return None
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+
+def _dtype_represents(dtype: str, value: str) -> bool:
+    number = float(value)
+    if dtype in {"Float32", "Float64"}:
+        return True
+    minimum, maximum = _INTEGER_RANGES[dtype]
+    return number.is_integer() and minimum <= number <= maximum
+
+
+def _source_gdal_dtype(piece: dict[str, Any]) -> str:
+    """Resolve an indexed source type to the GDAL spelling used by warps."""
+
+    raster_dtype = piece.get("raster_dtype")
+    if raster_dtype in _GDAL_TO_BYTES:
+        return str(raster_dtype)
+    data_type = str(piece.get("data_type") or "").casefold()
+    try:
+        return _STAC_TO_GDAL_DTYPE[data_type]
+    except KeyError as exc:
+        raise ValueError(
+            "Cannot choose a nodata-safe working type because an indexed source "
+            f"has no supported raster datatype: {raster_dtype or data_type or 'missing'}"
+        ) from exc
+
+
+def _smallest_scalar_for(number: float) -> str:
+    """Return a compact GDAL scalar type capable of storing ``number``."""
+
+    if not math.isfinite(number):
+        raise ValueError("nodata must be finite")
+    if not number.is_integer():
+        return "Float64"
+    integer = int(number)
+    for dtype in ("Byte", "Int8", "UInt16", "Int16", "UInt32", "Int32", "Int64"):
+        minimum, maximum = _INTEGER_RANGES[dtype]
+        if minimum <= integer <= maximum:
+            return dtype
+    return "Float64"
 
 
 @dataclass(frozen=True)
@@ -269,18 +340,16 @@ class RasterExtractor:
                         group[0]["item_id"],
                     ),
                 )
-            incomplete_tiles = {
-                tile_key for tile_key, _item_id in item_groups
-            }.difference(newest_items)
+            incomplete_tiles = {tile_key for tile_key, _item_id in item_groups}.difference(
+                newest_items
+            )
             if incomplete_tiles:
                 logger.warning(
                     "No single completed item has every requested feature for tile(s): %s",
                     ", ".join(sorted(incomplete_tiles)),
                 )
             existing = [
-                piece
-                for tile_key in sorted(newest_items)
-                for piece in newest_items[tile_key]
+                piece for tile_key in sorted(newest_items) for piece in newest_items[tile_key]
             ]
 
         order = {asset_key: index for index, asset_key in enumerate(self.config.asset_keys)}
@@ -310,9 +379,7 @@ class RasterExtractor:
         if self.config.target_crs.lower() != "auto":
             return self.config.target_crs
         epsg_codes = {
-            int(piece["proj_epsg"])
-            for piece in pieces
-            if piece.get("proj_epsg") is not None
+            int(piece["proj_epsg"]) for piece in pieces if piece.get("proj_epsg") is not None
         }
         if len(epsg_codes) == 1:
             return f"EPSG:{epsg_codes.pop()}"
@@ -341,6 +408,90 @@ class RasterExtractor:
             )
         return min(resolutions)
 
+    def _destination_nodata(
+        self,
+        pieces: Sequence[dict[str, Any]],
+    ) -> tuple[str, str | None]:
+        """Choose a common sentinel without consuming valid zero-probability data."""
+
+        destination = self.config.nodata
+        zero_is_valid = any(
+            str(piece["asset_key"]).casefold().startswith("cld_") and piece.get("nodata") is None
+            for piece in pieces
+        )
+        try:
+            destination_is_zero = float(destination) == 0
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"nodata must be numeric, got {destination!r}") from exc
+        if destination_is_zero and zero_is_valid:
+            destination = "-9999"
+            logger.warning(
+                "Destination nodata 0 collides with valid CLD probability 0; "
+                "using the signed sentinel -9999 for this mixed-feature extraction"
+            )
+
+        destination_number = float(destination)
+        source_dtype = _promote_dtype(_source_gdal_dtype(piece) for piece in pieces)
+        # A VRT inherits its source scalar type. Promote only when that type cannot
+        # represent the destination sentinel; floating sources must not be truncated.
+        working_dtype = None
+        if not _dtype_represents(source_dtype, destination):
+            working_dtype = _promote_dtype((source_dtype, _smallest_scalar_for(destination_number)))
+        return destination, working_dtype
+
+    def _band_contract(
+        self,
+        pieces: Sequence[dict[str, Any]],
+        *,
+        destination_nodata: str,
+    ) -> dict[str, Any]:
+        """Describe raw storage and physical-value transforms in band order."""
+
+        bands: list[dict[str, Any]] = []
+        for number, asset_key in enumerate(self.config.asset_keys, start=1):
+            sources = [piece for piece in pieces if piece["asset_key"] == asset_key]
+            transforms = {
+                (
+                    _json_number(piece.get("raster_scale")),
+                    _json_number(piece.get("raster_offset")),
+                )
+                for piece in sources
+            }
+            if len(transforms) != 1:
+                raise ValueError(
+                    f"Sources for {asset_key} have inconsistent scale/offset metadata; "
+                    "extract acquisitions with one physical-value transform at a time"
+                )
+            scale, offset = transforms.pop()
+            source_nodata = sorted(
+                {_json_number(piece.get("nodata")) for piece in sources},
+                key=lambda value: (value is not None, str(value)),
+            )
+            bands.append(
+                {
+                    "band": number,
+                    "asset_key": asset_key,
+                    "source_data_types": sorted(
+                        {
+                            str(piece.get("data_type") or piece.get("raster_dtype") or "")
+                            for piece in sources
+                        }
+                    ),
+                    "source_nodata_values": source_nodata,
+                    "output_nodata": _json_number(destination_nodata),
+                    "scale": scale,
+                    "offset": offset,
+                    "transform_applied": False,
+                    "zero_is_valid": None in source_nodata,
+                }
+            )
+        return {
+            "schema_version": 1,
+            "storage": "raw",
+            "transform": "physical = raw * scale + offset",
+            "bands": bands,
+        }
+
     def _warp_feature(
         self,
         *,
@@ -348,12 +499,13 @@ class RasterExtractor:
         sources: Sequence[dict[str, Any]],
         target_crs: str,
         resolution: float,
+        destination_nodata: str,
+        working_dtype: str | None,
         output_vrt: Path,
     ) -> None:
         west, south, east, north = self.config.bbox
         logger.info(
-            "Building virtual feature mosaic – feature=%s sources=%d target_crs=%s "
-            "resolution=%s",
+            "Building virtual feature mosaic – feature=%s sources=%d target_crs=%s resolution=%s",
             asset_key,
             len(sources),
             target_crs,
@@ -385,11 +537,16 @@ class RasterExtractor:
                 "-r",
                 self.config.resampling,
                 "-dstnodata",
-                self.config.nodata,
+                destination_nodata,
                 "-wm",
                 str(self.config.warp_memory_mib),
                 "-multi",
             ]
+            if working_dtype is not None:
+                command.extend(("-ot", working_dtype))
+            source_nodata = piece.get("nodata")
+            if source_nodata is not None:
+                command.extend(("-srcnodata", str(source_nodata)))
             if self.config.cutline_path is not None:
                 command.extend(["-cutline", str(self.config.cutline_path)])
             command.extend([str(piece["local_path"]), str(warped_source)])
@@ -400,34 +557,41 @@ class RasterExtractor:
                 self._gdal["gdalbuildvrt"],
                 "-overwrite",
                 "-srcnodata",
-                self.config.nodata,
+                destination_nodata,
                 "-vrtnodata",
-                self.config.nodata,
+                destination_nodata,
                 str(output_vrt),
                 *(str(path) for path in warped_sources),
             ]
         )
 
     @staticmethod
-    def _set_band_descriptions(stack_vrt: Path, asset_keys: Sequence[str]) -> None:
+    def _set_band_metadata(stack_vrt: Path, band_contract: dict[str, Any]) -> None:
         tree = ET.parse(stack_vrt)
         root = tree.getroot()
         bands = root.findall("VRTRasterBand")
-        if len(bands) != len(asset_keys):
+        contract_bands = band_contract["bands"]
+        if len(bands) != len(contract_bands):
             raise RuntimeError(
-                f"Stacked VRT has {len(bands)} bands; expected {len(asset_keys)}"
+                f"Stacked VRT has {len(bands)} bands; expected {len(contract_bands)}"
             )
-        for band, asset_key in zip(bands, asset_keys, strict=True):
+        for band, contract in zip(bands, contract_bands, strict=True):
             description = band.find("Description")
             if description is None:
                 description = ET.SubElement(band, "Description")
-            description.text = asset_key
+            description.text = contract["asset_key"]
+            for element_name, field in (("Scale", "scale"), ("Offset", "offset")):
+                value = contract[field]
+                if value is None:
+                    continue
+                element = band.find(element_name)
+                if element is None:
+                    element = ET.SubElement(band, element_name)
+                element.text = str(value)
         tree.write(stack_vrt, encoding="UTF-8", xml_declaration=True)
 
     def _inspect_vrt(self, stack_vrt: Path) -> tuple[int, int, list[str]]:
-        completed = self._run_command(
-            [self._gdal["gdalinfo"], "-json", str(stack_vrt)]
-        )
+        completed = self._run_command([self._gdal["gdalinfo"], "-json", str(stack_vrt)])
         metadata = json.loads(completed.stdout)
         width, height = (int(value) for value in metadata["size"])
         dtypes = [str(band["type"]) for band in metadata.get("bands", [])]
@@ -440,6 +604,7 @@ class RasterExtractor:
         partial_path: Path,
         output_dtype: str,
         asset_keys: Sequence[str],
+        band_contract: dict[str, Any],
     ) -> None:
         command = [
             self._gdal["gdal_translate"],
@@ -460,6 +625,9 @@ class RasterExtractor:
             "NUM_THREADS=1",
             "-mo",
             f"TERRAVAULT_ASSET_KEYS={','.join(asset_keys)}",
+            "-mo",
+            "TERRAVAULT_BAND_CONTRACT="
+            + json.dumps(band_contract, sort_keys=True, separators=(",", ":")),
             str(stack_vrt),
             str(partial_path),
         ]
@@ -491,6 +659,11 @@ class RasterExtractor:
             key: [piece for piece in pieces if piece["asset_key"] == key]
             for key in self.config.asset_keys
         }
+        destination_nodata, working_dtype = self._destination_nodata(pieces)
+        band_contract = self._band_contract(
+            pieces,
+            destination_nodata=destination_nodata,
+        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         logger.info(
@@ -516,6 +689,8 @@ class RasterExtractor:
                     sources=grouped[asset_key],
                     target_crs=target_crs,
                     resolution=resolution,
+                    destination_nodata=destination_nodata,
+                    working_dtype=working_dtype,
                     output_vrt=feature_vrt,
                 )
                 feature_vrts.append(feature_vrt)
@@ -530,18 +705,21 @@ class RasterExtractor:
                     *(str(path) for path in feature_vrts),
                 ]
             )
-            self._set_band_descriptions(stack_vrt, self.config.asset_keys)
+            self._set_band_metadata(stack_vrt, band_contract)
             width, height, source_dtypes = self._inspect_vrt(stack_vrt)
             output_dtype = (
                 _promote_dtype(source_dtypes)
                 if self.config.output_dtype == "auto"
                 else self.config.output_dtype
             )
+            if not _dtype_represents(output_dtype, destination_nodata):
+                raise ValueError(
+                    f"Destination nodata {destination_nodata} is not representable as "
+                    f"{output_dtype}; choose a signed or floating --output-dtype"
+                )
+            band_contract["output_dtype"] = output_dtype
             estimated_bytes = (
-                width
-                * height
-                * len(self.config.asset_keys)
-                * _GDAL_TO_BYTES[output_dtype]
+                width * height * len(self.config.asset_keys) * _GDAL_TO_BYTES[output_dtype]
             )
             estimated_gib = estimated_bytes / (1024**3)
             logger.info(
@@ -573,6 +751,7 @@ class RasterExtractor:
                         partial_path=partial_path,
                         output_dtype=output_dtype,
                         asset_keys=self.config.asset_keys,
+                        band_contract=band_contract,
                     )
                     os.replace(partial_path, output_path)
                     written_bytes = output_path.stat().st_size
@@ -580,16 +759,14 @@ class RasterExtractor:
                 partial_path.unlink(missing_ok=True)
 
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "dry_run": self.config.dry_run,
             "dataset_db": str(self.config.dataset_db.resolve()),
             "output_path": str(output_path),
             "bbox_wgs84": list(self.config.bbox),
             "cutline_path": (
-                None
-                if self.config.cutline_path is None
-                else str(self.config.cutline_path)
+                None if self.config.cutline_path is None else str(self.config.cutline_path)
             ),
             "start_datetime": (
                 None
@@ -597,16 +774,16 @@ class RasterExtractor:
                 else self.config.start_datetime.isoformat()
             ),
             "end_datetime": (
-                None
-                if self.config.end_datetime is None
-                else self.config.end_datetime.isoformat()
+                None if self.config.end_datetime is None else self.config.end_datetime.isoformat()
             ),
             "selection": self.config.selection,
             "target_crs": target_crs,
             "resolution": resolution,
             "resampling": self.config.resampling,
-            "nodata": self.config.nodata,
+            "requested_nodata": self.config.nodata,
+            "nodata": destination_nodata,
             "asset_keys_in_band_order": list(self.config.asset_keys),
+            "band_contract": band_contract,
             "width": width,
             "height": height,
             "band_count": len(self.config.asset_keys),
@@ -621,6 +798,10 @@ class RasterExtractor:
                     "acquisition_time": piece["acquisition_time"].isoformat(),
                     "asset_key": piece["asset_key"],
                     "local_path": piece["local_path"],
+                    "nodata": _json_number(piece.get("nodata")),
+                    "data_type": piece.get("data_type"),
+                    "raster_scale": _json_number(piece.get("raster_scale")),
+                    "raster_offset": _json_number(piece.get("raster_offset")),
                 }
                 for piece in pieces
             ],

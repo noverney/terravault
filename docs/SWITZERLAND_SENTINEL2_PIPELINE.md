@@ -98,6 +98,75 @@ documents the 2500 × 2500 synchronous limit. The
 [Sentinel-2 L2A data reference](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Data/S2L2A.html)
 is the source of the layer list and types.
 
+## Native FORCE cloud-processing branch
+
+The country overview and rolling archive above use Sentinel-2 L2A. TerraVault
+also has a separate, native FORCE L2PS branch for experiments that require
+FORCE's own atmospheric correction and cloud/cirrus/shadow/snow
+classification:
+
+```text
+saved Sentinel-2 L1C STAC Item
+       │
+       ├── safe_manifest + S3 keys ──► complete SAFE directory
+       └── Product + CDSE bearer ────► complete SAFE ZIP
+                                      │
+                                      ▼
+                             terravault force-level2
+                                      │
+                                      ▼
+                      level2/products/<SAFE-stem>/
+                                      ├── BOA tiles + per-SAFE mosaic
+                                      ├── QAI tiles + per-SAFE mosaic
+                                      └── OVV tile quicklooks
+```
+
+FORCE L2PS cannot use the selected L2A native pieces or a country COG. Each
+input must be one complete `S2*_MSIL1C_*.SAFE[.zip]`, including product and
+granule metadata and every band (including B10). `force-level2` validates that
+boundary before processing.
+
+The defaults are Switzerland-oriented: EPSG:2056, 10 m pixels, 30 km FORCE
+tiles, and a 5.5° E / 48.0° N grid origin. Ten metres is the highest native
+Sentinel-2 resolution; FORCE merges coarser bands to that grid. Use a DEM
+covering every input footprint. Without one the job continues, but
+topographic correction is disabled and atmospheric/cloud-shadow quality is
+reduced. The output root's `_terravault/force-l2/cube.json` fixes this grid;
+changing it requires a new root.
+
+One product is only a processing unit, not Swiss-wide coverage. For a dated
+country result, select every L1C STAC item intersecting the versioned Swiss
+polygon and run those products sequentially. Each SAFE is published in its own
+directory; same-date/sensor granules do not merge. The command persists each
+download, queue, parameter file, batch log, input fingerprint, BOA/QAI list,
+OVV list, and per-SAFE mosaics so a stopped job can be rerun safely. Completion
+requires the expected cube definition, CRS, tile dimensions/alignment, and
+matching BOA/QAI/OVV tile coverage.
+
+Complete S3 SAFE trees are downloaded into a hidden per-product staging
+directory. The previous verified publication stays available until the exact
+object list, sizes, per-object SHA-256 values, SAFE hierarchy, and all 13 L1C
+bands pass validation; only then is the staged directory promoted.
+
+This command does not build an acquisition-level or national native FORCE
+mosaic, and it is not integrated into `watch` or `historic`. It is the durable
+per-product primitive around which L1C discovery, scheduling, and downstream
+pooling still need to be built.
+
+For a controlled cloud-mask comparison, `force-visualize --force-qai` aligns a
+matching FORCE QAI mosaic and creates a three-panel raw/CDSE/FORCE diagnostic.
+Every panel uses the same L2A B04/B08 NDVI; only the quality policy changes.
+The default FORCE mask `0x031F` screens nodata, all cloud states, shadow, snow,
+subzero, and saturation. Today that QAI mosaic is selected from one per-SAFE
+publication, not from a country-wide native mosaic.
+
+The existing real Zurich FORCE artifact validates only the L2A
+external-feature bridge. Native Zurich L2PS is not yet claimed as a successful
+live run because the 2026-08-04 preflight returned `InvalidAccessKeyId` for the
+configured S3 pair and no Product bearer/account fallback was configured. See
+[FORCE_POSTPROCESSING.md](FORCE_POSTPROCESSING.md) for commands, credential
+routes, QAI bits, and state layout.
+
 ## Rolling production architecture
 
 ```text
@@ -261,9 +330,17 @@ native S3 ingestion is the dependable baseline.
    latest-per-tile stitched COG extraction with feature selection, reprojection,
    dry-run sizing and a source/band manifest. See
    [`RASTER_QUERY_AND_EXTRACTION.md`](RASTER_QUERY_AND_EXTRACTION.md).
-5. **Next:** add an OData subscription consumer alongside the implemented
+5. **Implemented and unit-tested, live credential validation pending:**
+   resumable complete L1C SAFE acquisition plus one-product native FORCE L2PS
+   into an isolated, verified per-SAFE BOA/QAI publication, with immutable-grid
+   enforcement, atomic restart/provenance state, and the three-way quality-mask
+   diagnostic.
+6. **Next:** add durable country-wide `sentinel-2-l1c` discovery/queue
+   orchestration and a separate acquisition/national pooling or virtual-mosaic
+   layer around the per-product L2PS primitive.
+7. **Next:** add an OData subscription consumer alongside the implemented
    STAC reconciliation scan.
-6. **Then:** version an official Swiss boundary in deployment configuration
+8. **Then:** version an official Swiss boundary in deployment configuration
    and add raster coverage/format QA.
-7. **Finally:** optional per-piece COG/Zarr conversion, monitoring and
+9. **Finally:** optional per-piece COG/Zarr conversion, monitoring and
    deployment packaging.

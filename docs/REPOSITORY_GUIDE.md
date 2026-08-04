@@ -20,9 +20,11 @@ changes do not require rediscovering the repository.
 | `terravault/historical.py` | Windowed historical backfill and progress |
 | `terravault/dataset_catalog.py` | Top-level DuckDB raster-piece catalogue |
 | `terravault/extractor.py` | Block-wise VRT mosaics and stitched multiband COG queries |
-| `terravault/force.py` | Durable FORCE external-feature cube/mosaic bridge |
-| `terravault/force_visualization.py` | NDVI COG and color quicklook generation |
-| `terravault/cli.py` | `run`, `watch`, `historic`, `query`, `extract`, `force`, `force-visualize` and `collections` |
+| `terravault/force.py` | Durable L2A → FORCE external-feature cube/mosaic bridge (not BOA/QAI) |
+| `terravault/l1c_download.py` | Resumable complete L1C SAFE-tree or Product-ZIP acquisition from a saved STAC Item |
+| `terravault/force_level2.py` | Native FORCE L2PS from complete L1C into atomically published, isolated per-SAFE BOA/QAI/OVV products |
+| `terravault/force_visualization.py` | NDVI COGs, quicklooks, and raw/CDSE/FORCE-QAI mask diagnostics |
+| `terravault/cli.py` | `run`, `watch`, `historic`, `query`, `extract`, `force`, `force-level2`, `force-status`, `force-visualize` and `collections` |
 | `examples/switzerland_patch/` | Small-patch and country-scale runnable examples |
 | `examples/query/` | Local DuckDB and stitched-COG API examples |
 | `examples/postprocessing/` | FORCE postprocessing orchestration |
@@ -30,7 +32,9 @@ changes do not require rediscovering the repository.
 
 The core `Pipeline` is a STAC asset ingester. The Process API helpers are a
 separate path for generated subsets/mosaics. Do not treat the synchronous
-Process API as a native-resolution country archive.
+Process API as a native-resolution country archive. Likewise, keep the L2A
+external-feature bridge separate from native FORCE L2PS: only the latter owns
+atmospheric/cloud processing and emits BOA/QAI.
 
 ## Development setup
 
@@ -42,8 +46,9 @@ ruff check .
 python -m compileall -q terravault examples
 ```
 
-The `overview` extra installs Pillow for the public-thumbnail mosaic. The
-`raster` extra installs rasterio for analysis-ready raster inspection.
+The `overview` extra installs Pillow for the public-thumbnail mosaic; the
+`visualization` extra installs it for FORCE comparison plots. The `raster`
+extra installs rasterio for analysis-ready raster inspection.
 
 ## Verification levels
 
@@ -99,6 +104,27 @@ The `overview` extra installs Pillow for the public-thumbnail mosaic. The
    python -m pytest -q tests/test_force_visualization.py
    ```
 
+10. Complete L1C acquisition and native FORCE L2PS state/output contracts:
+
+    ```bash
+    python -m pytest -q tests/test_l1c_download.py tests/test_force_level2.py
+    ```
+
+11. Native L2PS command plan for a locally available complete SAFE:
+
+    ```bash
+    terravault force-level2 \
+      --input /data/l1c/S2B_MSIL1C_20260717T103029_N0512_R108_T32TMT_20260717T142404.SAFE.zip \
+      --output-root /tmp/terravault-force-l2 \
+      --runtime docker \
+      --dry-run
+    ```
+
+    A dry run validates the SAFE and records the planned commands in terminal
+    output; it does not prove a real atmospheric/cloud processing run. Do not
+    use `--dry-run` with `--stac-item`, because that route must acquire the
+    SAFE first.
+
 ## Invariants
 
 - A failed or missing requested asset is not marked ingested.
@@ -113,11 +139,34 @@ The `overview` extra installs Pillow for the public-thumbnail mosaic. The
 - Extraction pixels stay in GDAL's bounded block pipeline and never become a
   country-sized Python array.
 - Selected TerraVault L2A assets enter FORCE as external features, never as
-  FORCE BOA/QAI ARD; true FORCE Level-2 requires complete Level-1 products.
+  FORCE BOA/QAI ARD. Native FORCE Level-2 accepts only a complete Sentinel-2
+  L1C SAFE/SAFE ZIP with product/granule metadata and every band including B10.
+- Native L2PS uses the stable Swiss grid by default (EPSG:2056, 10 m, 30 km
+  tiles, 5.5° E / 48.0° N origin). Missing DEM input is permitted only with a
+  warning, disabled topographic correction, and reduced shadow/atmospheric
+  quality.
+- `_terravault/force-l2/cube.json` makes the native grid immutable for an
+  output root; even `--overwrite` cannot change it.
+- Native FORCE outputs are isolated below
+  `level2/products/<SAFE-stem>/`. Same-date SAFE products do not merge. A retry
+  discards only that SAFE's partial attempt and publishes only after cube,
+  CRS/grid, BOA/QAI/OVV, and mosaic validation.
+- Complete S3 SAFE downloads use a hidden staging tree and retain the prior
+  verified SAFE until exact file-list, size, per-object SHA-256, and SAFE
+  structure checks pass.
+- `force-level2` is a durable per-product primitive. It does not create a
+  pooled acquisition/national FORCE mosaic and is not yet dispatched by
+  `watch` or `historic`.
 - FORCE jobs verify physical chips and mosaics in addition to process exit
   codes, and reuse an identical completed input by fingerprint.
 - FORCE visualizations keep pixel calculation in GDAL, retain a georeferenced
-  Float32 COG and record masks, colors, statistics and commands.
+  Float32 COG and record masks, colors, statistics and commands. In a
+  three-panel diagnostic, raw, CDSE-masked, and FORCE-QAI-masked panels all use
+  the same L2A B04/B08 pixels; the FORCE panel must not silently switch to BOA.
+- The default FORCE visualization mask is `0x031F`: nodata, every non-clear
+  cloud state, cloud shadow, snow, subzero, and saturation. QAI is aligned with
+  nearest-neighbour resampling and date/sensor provenance is checked when
+  available.
 - Logs rotate below `STORAGE_ROOT/_terravault/logs/` and never include secrets.
 - Process API width and height never exceed 2500 pixels.
 - Secrets belong in `.env` or a secret manager and must not be committed.

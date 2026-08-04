@@ -34,6 +34,26 @@ from .downloader import DownloadConfig
 from .env import load_dotenv
 
 
+class _ForceLevel2Termination(KeyboardInterrupt):
+    """Translate a command-scoped termination signal into a durable interruption."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        self.exit_code = 128 + signum
+        super().__init__(f"Received signal {signum}")
+
+
+def _integer_literal(value: str) -> int:
+    """Parse decimal or prefixed hexadecimal/octal/binary CLI integers."""
+
+    try:
+        return int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer such as 799 or 0x031F, got {value!r}"
+        ) from exc
+
+
 def _setup_logging(verbose: bool, log_file: str | Path | None = None) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     formatter = logging.Formatter(
@@ -55,12 +75,30 @@ def _setup_logging(verbose: bool, log_file: str | Path | None = None) -> None:
         file_handler.setFormatter(formatter)
         handlers.append(file_handler)
     logging.basicConfig(
-        level=level,
+        level=logging.INFO,
         handlers=handlers,
         force=True,
     )
+    logging.getLogger("terravault").setLevel(level)
+    # HTTP/S3 clients can include signed headers, credential identifiers and
+    # bearer material in DEBUG records. TerraVault verbosity must never enable
+    # those third-party wire logs.
+    for noisy_logger in ("boto3", "botocore", "s3transfer", "urllib3", "requests"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     if log_file is not None:
         logging.getLogger(__name__).info("Operational log file: %s", path.resolve())
+
+
+def _s3_secret(secret_file: str | None) -> str:
+    """Load an S3 secret without placing it in the process argument list."""
+
+    if secret_file is None:
+        return os.environ.get("TERRAVAULT_CDSE_S3_SECRET_KEY", "")
+    path = Path(secret_file).expanduser()
+    value = path.read_text(encoding="utf-8").strip()
+    if not value:
+        raise ValueError(f"CDSE S3 secret file is empty: {path}")
+    return value
 
 
 def _default_log_file(args: argparse.Namespace) -> Path | None:
@@ -173,8 +211,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             s3_config = S3Config(
                 access_key=args.s3_access_key
                 or os.environ.get("TERRAVAULT_CDSE_S3_ACCESS_KEY", ""),
-                secret_key=args.s3_secret_key
-                or os.environ.get("TERRAVAULT_CDSE_S3_SECRET_KEY", ""),
+                secret_key=_s3_secret(args.s3_secret_key_file),
                 endpoint_url=args.s3_endpoint
                 or os.environ.get(
                     "TERRAVAULT_CDSE_S3_ENDPOINT",
@@ -262,8 +299,7 @@ def cmd_historic(args: argparse.Namespace) -> int:
             s3_config = S3Config(
                 access_key=args.s3_access_key
                 or os.environ.get("TERRAVAULT_CDSE_S3_ACCESS_KEY", ""),
-                secret_key=args.s3_secret_key
-                or os.environ.get("TERRAVAULT_CDSE_S3_SECRET_KEY", ""),
+                secret_key=_s3_secret(args.s3_secret_key_file),
                 endpoint_url=args.s3_endpoint
                 or os.environ.get(
                     "TERRAVAULT_CDSE_S3_ENDPOINT",
@@ -339,11 +375,7 @@ def cmd_query(args: argparse.Namespace) -> int:
             print(json.dumps(catalog.summary(), indent=2, default=str))
             return 0
         start = None if args.start_date is None else parse_utc_date(args.start_date)
-        end = (
-            None
-            if args.end_date is None
-            else parse_utc_date(args.end_date, inclusive_end=True)
-        )
+        end = None if args.end_date is None else parse_utc_date(args.end_date, inclusive_end=True)
         bbox = None if args.bbox is None else tuple(args.bbox)
         pieces = catalog.query_raster_pieces(
             bbox=bbox,
@@ -377,11 +409,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
     try:
         roi = load_roi(bbox=args.bbox, geojson_path=args.roi)
         start = None if args.start_date is None else parse_utc_date(args.start_date)
-        end = (
-            None
-            if args.end_date is None
-            else parse_utc_date(args.end_date, inclusive_end=True)
-        )
+        end = None if args.end_date is None else parse_utc_date(args.end_date, inclusive_end=True)
         config = ExtractionConfig(
             dataset_db=Path(args.dataset_db),
             bbox=roi.bbox,
@@ -488,6 +516,9 @@ def cmd_force_visualize(args: argparse.Namespace) -> int:
                 cloud_threshold=args.cloud_threshold,
                 crop_to_force_input=not args.no_crop_to_force_input,
                 quicklook_width=args.quicklook_width,
+                force_qai_path=(None if args.force_qai is None else Path(args.force_qai)),
+                force_qai_mask=args.force_qai_mask,
+                allow_force_time_mismatch=args.allow_force_time_mismatch,
                 debug_plot=not args.no_debug_plot,
                 debug_plot_width=args.debug_plot_width,
                 overwrite=args.overwrite,
@@ -503,15 +534,209 @@ def cmd_force_visualize(args: argparse.Namespace) -> int:
         f"FORCE visualization {result.status}{duplicate}"
         f"  ndvi={result.ndvi_path}"
         f"  quicklook={result.quicklook_path}"
+        f"  force_ndvi={result.force_ndvi_path}"
+        f"  force_quicklook={result.force_quicklook_path}"
         f"  debug_plot={result.debug_plot_path}"
         f"  size={result.width}x{result.height}"
         f"  valid_percent={result.valid_percent}"
+        f"  force_valid_percent={result.force_valid_percent}"
         f"  manifest={result.manifest_path}"
     )
     if result.status == "planned":
         print("Commands:")
         for command in result.commands:
             print(f"  {shlex.join(command)}")
+    return 0
+
+
+def _cmd_force_level2(args: argparse.Namespace) -> int:
+    import shlex
+
+    from .force_level2 import ForceLevel2Config, ForceLevel2Processor
+
+    input_path: Path
+    download_result = None
+    try:
+        if args.stac_item is not None:
+            if args.dry_run:
+                raise ValueError(
+                    "--dry-run with --stac-item cannot plan pixels before the SAFE "
+                    "exists; download once or pass a local --input"
+                )
+            from .l1c_download import L1CDownloadConfig, L1CProductDownloader
+            from .s3_downloader import S3Config
+
+            env_auth = CDSEDownloadAuthConfig.from_env(os.environ)
+            s3_access = args.s3_access_key or os.environ.get("TERRAVAULT_CDSE_S3_ACCESS_KEY", "")
+            s3_secret = _s3_secret(args.s3_secret_key_file)
+            s3 = None
+            if s3_access and s3_secret:
+                s3 = S3Config(
+                    access_key=s3_access,
+                    secret_key=s3_secret,
+                    endpoint_url=args.s3_endpoint
+                    or os.environ.get(
+                        "TERRAVAULT_CDSE_S3_ENDPOINT",
+                        "https://eodata.dataspace.copernicus.eu",
+                    ),
+                    region_name=args.s3_region
+                    or os.environ.get("TERRAVAULT_CDSE_S3_REGION", "default"),
+                    chunk_size=args.download_chunk_mib * 1024 * 1024,
+                )
+            elif s3_access or s3_secret:
+                logging.getLogger(__name__).warning(
+                    "Ignoring incomplete CDSE S3 credentials and trying the "
+                    "authenticated Product ZIP route"
+                )
+            download_result = L1CProductDownloader(
+                L1CDownloadConfig(
+                    item_path=Path(args.stac_item),
+                    output_root=Path(args.output_root),
+                    s3=s3,
+                    auth=env_auth,
+                    chunk_size=args.download_chunk_mib * 1024 * 1024,
+                    max_retries=args.download_max_retries,
+                    retry_base_seconds=args.download_retry_base_seconds,
+                    quota_wait_seconds=args.download_quota_wait_seconds,
+                )
+            ).run()
+            input_path = download_result.product_path
+        else:
+            input_path = Path(args.input)
+
+        result = ForceLevel2Processor(
+            ForceLevel2Config(
+                input_path=input_path,
+                output_root=Path(args.output_root),
+                runtime=args.runtime,
+                docker_image=args.docker_image,
+                docker_platform=(
+                    None if args.docker_platform.lower() == "none" else args.docker_platform
+                ),
+                mount_root=None if args.mount_root is None else Path(args.mount_root),
+                target_crs=args.target_crs,
+                origin_lon=args.origin_lon,
+                origin_lat=args.origin_lat,
+                tile_size=args.tile_size,
+                resolution=args.resolution,
+                aoi_path=None if args.aoi is None else Path(args.aoi),
+                dem_path=None if args.dem is None else Path(args.dem),
+                dem_nodata=args.dem_nodata,
+                cloud_buffer=args.cloud_buffer,
+                cirrus_buffer=args.cirrus_buffer,
+                shadow_buffer=args.shadow_buffer,
+                snow_buffer=args.snow_buffer,
+                cloud_threshold=args.force_cloud_threshold,
+                shadow_threshold=args.force_shadow_threshold,
+                max_cloud_cover_frame=args.max_cloud_cover_frame,
+                max_cloud_cover_tile=args.max_cloud_cover_tile,
+                resolution_merge=args.resolution_merge,
+                nproc=args.processes,
+                nthread=args.threads,
+                parallel_reads=args.parallel_reads,
+                output_overview=not args.no_force_overview,
+                overwrite=args.overwrite,
+                retry_failed=args.retry_failed,
+                dry_run=args.dry_run,
+                progress_interval_seconds=args.progress_interval_seconds,
+            )
+        ).run()
+    except KeyboardInterrupt as exc:
+        logging.getLogger(__name__).warning(
+            "FORCE native Level-2 command interrupted; resumable state was retained"
+        )
+        print("Interrupted; resumable download and job state were retained.", file=sys.stderr)
+        return getattr(exc, "exit_code", 130)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).exception("FORCE native Level-2 command failed")
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    if download_result is not None:
+        duplicate = " (already complete; skipped)" if download_result.skipped else ""
+        print(
+            f"L1C SAFE download {download_result.status}{duplicate}"
+            f"  mode={download_result.source_mode}"
+            f"  files={download_result.file_count}"
+            f"  bytes={download_result.byte_count}"
+            f"  path={download_result.product_path}"
+            f"  manifest={download_result.manifest_path}"
+        )
+    duplicate = " (unchanged; skipped)" if result.skipped else ""
+    print(
+        f"FORCE native Level-2 {result.status}{duplicate}"
+        f"  runtime={result.runtime}"
+        f"  BOA={len(result.boa_paths)}"
+        f"  QAI={len(result.qai_paths)}"
+        f"  OVV={len(result.overview_paths)}"
+        f"  BOA_mosaic={result.boa_mosaic_path}"
+        f"  QAI_mosaic={result.qai_mosaic_path}"
+        f"  manifest={result.manifest_path}"
+    )
+    if result.status == "planned":
+        print("Commands:")
+        for command in result.commands:
+            print(f"  {shlex.join(command)}")
+    return 0
+
+
+def cmd_force_level2(args: argparse.Namespace) -> int:
+    """Run FORCE L2PS with SIGTERM mapped to its durable interruption path."""
+
+    import signal
+
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def handle_sigterm(signum: int, _frame: object) -> None:
+        raise _ForceLevel2Termination(signum)
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    try:
+        return _cmd_force_level2(args)
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+
+
+def cmd_force_status(args: argparse.Namespace) -> int:
+    """Print observable native FORCE milestones for operators."""
+
+    from dataclasses import asdict
+
+    from .force_level2 import inspect_force_level2_status
+
+    statuses = inspect_force_level2_status(args.output_root, job_stem=args.job)
+    if not statuses:
+        print("No FORCE Level-2 job manifests found.", file=sys.stderr)
+        return 1
+    if args.json:
+        payload = []
+        for status in statuses:
+            entry = asdict(status)
+            entry["manifest_path"] = str(status.manifest_path)
+            entry["progress_path"] = (
+                None if status.progress_path is None else str(status.progress_path)
+            )
+            entry["log_paths"] = [str(path) for path in status.log_paths]
+            payload.append(entry)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    for status in statuses:
+        elapsed = (
+            "unknown"
+            if status.elapsed_seconds is None
+            else f"{status.elapsed_seconds / 60:.1f} min"
+        )
+        print(
+            f"{status.job_stem}: status={status.status} phase={status.phase} "
+            f"elapsed={elapsed} queue={status.queue_status or 'unknown'} "
+            f"BOA/QAI/OVV={status.boa_tiles}/{status.qai_tiles}/{status.overview_tiles} "
+            f"bytes={status.output_bytes} within_scene_percent=unavailable"
+        )
+        print(f"  manifest={status.manifest_path}")
+        if status.progress_path is not None:
+            print(f"  progress={status.progress_path}")
+        for path in status.log_paths:
+            print(f"  log={path}")
     return 0
 
 
@@ -680,10 +905,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=14,
         metavar="D",
-        help=(
-            "First-run window for the latest near-full-footprint product per tile "
-            "(default: 14)"
-        ),
+        help=("First-run window for the latest near-full-footprint product per tile (default: 14)"),
     )
     watch_p.add_argument(
         "--catalog-url",
@@ -807,10 +1029,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="CDSE S3 access key (prefer TERRAVAULT_CDSE_S3_ACCESS_KEY)",
     )
     watch_p.add_argument(
-        "--s3-secret-key",
+        "--s3-secret-key-file",
         default=None,
-        metavar="SECRET",
-        help="CDSE S3 secret key (prefer TERRAVAULT_CDSE_S3_SECRET_KEY)",
+        metavar="PATH",
+        help="Read CDSE S3 secret from a file (prefer TERRAVAULT_CDSE_S3_SECRET_KEY)",
     )
     watch_p.add_argument(
         "--s3-endpoint",
@@ -996,10 +1218,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="CDSE S3 access key (prefer TERRAVAULT_CDSE_S3_ACCESS_KEY)",
     )
     historic_p.add_argument(
-        "--s3-secret-key",
+        "--s3-secret-key-file",
         default=None,
-        metavar="SECRET",
-        help="CDSE S3 secret key (prefer TERRAVAULT_CDSE_S3_SECRET_KEY)",
+        metavar="PATH",
+        help="Read CDSE S3 secret from a file (prefer TERRAVAULT_CDSE_S3_SECRET_KEY)",
     )
     historic_p.add_argument(
         "--s3-endpoint",
@@ -1352,10 +1574,187 @@ def build_parser() -> argparse.ArgumentParser:
     )
     force_p.set_defaults(func=cmd_force)
 
+    # --------------------------------------------------------- force-level2
+    force_l2_p = sub.add_parser(
+        "force-level2",
+        help="Run native FORCE L2PS cloud processing on a complete Sentinel-2 L1C SAFE",
+    )
+    force_l2_p.add_argument(
+        "--env-file",
+        default=".env",
+        metavar="PATH",
+        help="Optional .env file (default: .env)",
+    )
+    force_l2_input = force_l2_p.add_mutually_exclusive_group(required=True)
+    force_l2_input.add_argument(
+        "--input",
+        metavar="SAFE_OR_ZIP",
+        help="Complete local S2*_MSIL1C_*.SAFE directory or .SAFE.zip",
+    )
+    force_l2_input.add_argument(
+        "--stac-item",
+        metavar="ITEM_JSON",
+        help="L1C STAC item JSON; download the complete SAFE before processing",
+    )
+    force_l2_p.add_argument(
+        "--output-root",
+        required=True,
+        metavar="DIR",
+        help="Root for Level-1 input, FORCE BOA/QAI/OVV, state, provenance and logs",
+    )
+    force_l2_p.add_argument(
+        "--runtime",
+        choices=("auto", "native", "docker"),
+        default="auto",
+        help="FORCE runtime; auto uses native only on Linux, otherwise Docker",
+    )
+    force_l2_p.add_argument(
+        "--docker-image",
+        default=FORCE_DOCKER_IMAGE,
+        metavar="IMAGE",
+        help=f"FORCE container image version tag (default: {FORCE_DOCKER_IMAGE})",
+    )
+    force_l2_p.add_argument(
+        "--docker-platform",
+        default=FORCE_DOCKER_PLATFORM,
+        metavar="PLATFORM",
+        help=f"Container platform; use none to omit (default: {FORCE_DOCKER_PLATFORM})",
+    )
+    force_l2_p.add_argument(
+        "--mount-root",
+        default=None,
+        metavar="DIR",
+        help="Docker volume root containing every input and output path",
+    )
+    force_l2_p.add_argument("--target-crs", default="EPSG:2056", metavar="CRS")
+    force_l2_p.add_argument("--origin-lon", type=float, default=5.5, metavar="DEG")
+    force_l2_p.add_argument("--origin-lat", type=float, default=48.0, metavar="DEG")
+    force_l2_p.add_argument("--tile-size", type=int, default=30_000, metavar="UNITS")
+    force_l2_p.add_argument("--resolution", type=float, default=10, metavar="UNITS")
+    force_l2_p.add_argument(
+        "--aoi",
+        default=None,
+        metavar="VECTOR",
+        help="Optional vector cutline applied by FORCE after radiometric correction",
+    )
+    force_l2_p.add_argument(
+        "--dem",
+        default=None,
+        metavar="RASTER",
+        help="Recommended DEM covering the product for shadows, atmosphere and topology",
+    )
+    force_l2_p.add_argument("--dem-nodata", type=int, default=-32767, metavar="VALUE")
+    force_l2_p.add_argument("--cloud-buffer", type=float, default=300, metavar="M")
+    force_l2_p.add_argument("--cirrus-buffer", type=float, default=0, metavar="M")
+    force_l2_p.add_argument("--shadow-buffer", type=float, default=90, metavar="M")
+    force_l2_p.add_argument("--snow-buffer", type=float, default=30, metavar="M")
+    force_l2_p.add_argument(
+        "--force-cloud-threshold",
+        type=float,
+        default=0.225,
+        metavar="FRACTION",
+        help=(
+            "Required FORCE PRM cloud-probability value (default: 0.225); "
+            "FORCE's Sentinel-2 parallax branch does not use this tuning value"
+        ),
+    )
+    force_l2_p.add_argument(
+        "--force-shadow-threshold",
+        type=float,
+        default=0.02,
+        metavar="FRACTION",
+    )
+    force_l2_p.add_argument("--max-cloud-cover-frame", type=int, default=100, metavar="PCT")
+    force_l2_p.add_argument("--max-cloud-cover-tile", type=int, default=100, metavar="PCT")
+    force_l2_p.add_argument(
+        "--resolution-merge",
+        choices=("IMPROPHE", "REGRESSION", "STARFM", "NONE"),
+        default="IMPROPHE",
+    )
+    force_l2_p.add_argument(
+        "--processes",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Concurrent FORCE scene processes (default: 1; one S2 scene needs ~8 GiB)",
+    )
+    force_l2_p.add_argument("--threads", type=int, default=2, metavar="N")
+    force_l2_p.add_argument("--parallel-reads", action="store_true")
+    force_l2_p.add_argument("--no-force-overview", action="store_true")
+    force_l2_p.add_argument("--retry-failed", action="store_true")
+    force_l2_p.add_argument("--overwrite", action="store_true")
+    force_l2_p.add_argument("--dry-run", action="store_true")
+    force_l2_p.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Heartbeat/log interval for observable FORCE progress (default: 30)",
+    )
+    force_l2_p.add_argument("--s3-access-key", default=None, metavar="KEY")
+    force_l2_p.add_argument(
+        "--s3-secret-key-file",
+        default=None,
+        metavar="PATH",
+        help="Read CDSE S3 secret from a file (prefer TERRAVAULT_CDSE_S3_SECRET_KEY)",
+    )
+    force_l2_p.add_argument("--s3-endpoint", default=None, metavar="URL")
+    force_l2_p.add_argument("--s3-region", default=None, metavar="REGION")
+    force_l2_p.add_argument("--download-chunk-mib", type=int, default=8, metavar="MIB")
+    force_l2_p.add_argument(
+        "--download-max-retries",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Retry limit for transfer failures and quota waits (default: 5)",
+    )
+    force_l2_p.add_argument(
+        "--download-retry-base-seconds",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="Initial backoff for ordinary network/transfer failures (default: 2)",
+    )
+    force_l2_p.add_argument(
+        "--download-quota-wait-seconds",
+        type=float,
+        default=900.0,
+        metavar="SECONDS",
+        help="Fallback quota wait when Retry-After is absent (default: 900)",
+    )
+    force_l2_p.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Rotating log path (default: OUTPUT_ROOT/_terravault/logs/force-level2.log)",
+    )
+    force_l2_p.set_defaults(func=cmd_force_level2)
+
+    # --------------------------------------------------------- force-status
+    force_status_p = sub.add_parser(
+        "force-status",
+        help="Show observable phase, elapsed time and tile counts for native FORCE jobs",
+    )
+    force_status_p.add_argument(
+        "--env-file",
+        default=".env",
+        metavar="PATH",
+        help="Optional .env file (default: .env)",
+    )
+    force_status_p.add_argument("--output-root", required=True, metavar="DIR")
+    force_status_p.add_argument(
+        "--job",
+        default=None,
+        metavar="SAFE_STEM",
+        help="Inspect one SAFE job instead of every manifest",
+    )
+    force_status_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    force_status_p.set_defaults(func=cmd_force_status)
+
     # ------------------------------------------------------ force-visualize
     force_visualize_p = sub.add_parser(
         "force-visualize",
-        help="Create a quality-masked NDVI COG and PNG from a FORCE mosaic",
+        help=("Create a quality-masked NDVI COG and PNG from a TerraVault external-feature mosaic"),
     )
     force_visualize_p.add_argument(
         "--env-file",
@@ -1367,7 +1766,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--input",
         required=True,
         metavar="VRT_OR_TIFF",
-        help="FORCE multiband mosaic or chip",
+        help=(
+            "TerraVault external-feature B04/B08/SCL/CLD mosaic or chip; "
+            "native FORCE BOA is not accepted"
+        ),
     )
     force_visualize_p.add_argument(
         "--output-dir",
@@ -1385,6 +1787,27 @@ def build_parser() -> argparse.ArgumentParser:
     force_visualize_p.add_argument("--nir-band", type=int, default=None, metavar="N")
     force_visualize_p.add_argument("--scl-band", type=int, default=None, metavar="N")
     force_visualize_p.add_argument("--cloud-band", type=int, default=None, metavar="N")
+    force_visualize_p.add_argument(
+        "--force-qai",
+        default=None,
+        metavar="VRT_OR_TIFF",
+        help=("Native FORCE QAI mosaic/chip; enables the RAW/CDSE/FORCE three-panel comparison"),
+    )
+    force_visualize_p.add_argument(
+        "--force-qai-mask",
+        type=_integer_literal,
+        default=0x031F,
+        metavar="BITS",
+        help=(
+            "QAI bit mask in decimal or hex (default: 0x031F screens nodata, "
+            "cloud, shadow, snow, subzero and saturation)"
+        ),
+    )
+    force_visualize_p.add_argument(
+        "--allow-force-time-mismatch",
+        action="store_true",
+        help="Allow QAI date/sensor to differ from available L2A provenance",
+    )
     force_visualize_p.add_argument(
         "--cloud-threshold",
         type=float,
