@@ -206,8 +206,10 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# macOS Finder metadata (at every directory depth)
+**/.DS_Store
+
 # TerraVault local retrieval example outputs
-.DS_Store
 examples/switzerland_patch/data/*
 !examples/switzerland_patch/data/.gitkeep
 satellite_data/
