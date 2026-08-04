@@ -315,11 +315,14 @@ valid L2PS inputs. A local input must be a complete
 `S2*_MSIL1C_*.SAFE` directory or correctly rooted `.SAFE.zip`, including
 product/granule metadata and every L1C band (including B10).
 
-Docker is the default portable runtime. FORCE is Linux software; on macOS,
-TerraVault runs the version-tagged `linux/amd64` image and verifies the
-reported FORCE version rather than compiling or linking FORCE against macOS
-libraries. A Docker tag is mutable; use an image digest or controlled registry
-when byte-for-byte runtime identity is required.
+Docker is the default portable runtime. FORCE remains Linux software inside
+the container and is never linked against macOS libraries. ARM64/aarch64
+hosts—including Apple Silicon—default to the repository-built
+`terravault/force:3.10.04-arm64` image and `linux/arm64`; Intel/AMD x86_64
+hosts default to the official `davidfrantz/force:3.10.04` image and
+`linux/amd64`. TerraVault verifies the reported FORCE version before use. A
+Docker tag is mutable; use an image digest or controlled registry when
+byte-for-byte runtime identity is required.
 
 Plan the current Swiss-wide 10 m B04/B08/SCL/CLD extraction:
 
@@ -341,13 +344,19 @@ can be safely rerun. See
 
 Run genuine FORCE cloud/atmospheric processing on a complete local L1C SAFE:
 
-On Apple Silicon, first build the package's native Linux ARM64 runtime (this
-avoids the official image's AMD64/QEMU emulation):
+On an ARM64 host, first build the package's native Linux ARM64 runtime (on
+Apple Silicon this avoids the official image's AMD64/QEMU emulation):
 
 ```bash
 docker build --platform linux/arm64 \
   -f docker/force-arm64.Dockerfile \
   -t terravault/force:3.10.04-arm64 .
+```
+
+On an Intel Mac or AMD64 Linux host, no local FORCE image build is required:
+
+```bash
+docker pull --platform linux/amd64 davidfrantz/force:3.10.04
 ```
 
 ```bash

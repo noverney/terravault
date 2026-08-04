@@ -1,10 +1,10 @@
 # FORCE postprocessing
 
 TerraVault integrates [FORCE](https://github.com/davidfrantz/force) as a
-pinned Git submodule and as an optional postprocessing runtime. Apple Silicon
+pinned Git submodule and as an optional postprocessing runtime. ARM64/aarch64
 hosts default to TerraVault's native `terravault/force:3.10.04-arm64` image;
-other hosts default to `davidfrantz/force:3.10.04`. Both paths verify that
-`force-info` reports exactly FORCE 3.10.04 before processing.
+Intel/AMD x86_64 hosts default to `davidfrantz/force:3.10.04`. Both paths
+verify that `force-info` reports exactly FORCE 3.10.04 before processing.
 A Docker tag is mutable; use a digest or controlled registry if byte-for-byte
 image identity is required.
 
@@ -92,7 +92,7 @@ the pinned gitlink remains unchanged. Do not commit replacements inside
 
 ## Install and verify the runtime
 
-Docker is the recommended route. On Apple Silicon, build the native image from
+Docker is the recommended route. On an ARM64 host, build the native image from
 the pinned submodule (the build does not modify `vendor/force`):
 
 ```bash
@@ -109,6 +109,19 @@ On AMD64 Linux, the official image remains available:
 docker pull --platform linux/amd64 davidfrantz/force:3.10.04
 docker run --rm --platform linux/amd64 davidfrantz/force:3.10.04 force-info
 ```
+
+The same official `linux/amd64` image runs without architecture emulation in
+Docker Desktop on an Intel Mac. TerraVault's runtime defaults are:
+
+| Host architecture | Default image | Container platform | Setup |
+|---|---|---|---|
+| ARM64 / aarch64 (Apple Silicon or ARM Linux) | `terravault/force:3.10.04-arm64` | `linux/arm64` | Build `docker/force-arm64.Dockerfile` locally |
+| Intel / AMD x86_64 (macOS or Linux) | `davidfrantz/force:3.10.04` | `linux/amd64` | Pull the official image; no TerraVault image build required |
+
+There is currently no published multi-architecture `terravault/force` image:
+the ARM64 tag is produced locally, while x86_64 uses the upstream image. A
+different architecture or private registry can be selected with
+`TERRAVAULT_FORCE_DOCKER_IMAGE` and `TERRAVAULT_FORCE_DOCKER_PLATFORM`.
 
 FORCE is developed and tested on Ubuntu; upstream does not support migrating
 it to other operating systems. `--runtime auto` therefore considers a native
@@ -652,9 +665,11 @@ handling, WKT normalization, container environment and child-output checks
 live in TerraVault's wrapper, while the submodule still points to
 `davidfrantz/force`.
 
-Create a fork only when a required fix belongs inside FORCE itself—for
-example, a multi-architecture Dockerfile, a portable replacement for a
-Linux-only dependency, or an accepted change to `force-cube`. At that point:
+The repository-owned ARM64 Dockerfile adapts FORCE only while building the
+container and does not change the submodule. Create a fork only when a required
+fix belongs inside FORCE itself—for example, an upstreamable multi-architecture
+Dockerfile, a portable replacement for a Linux-only dependency, or an accepted
+change to `force-cube`. At that point:
 
 1. fork `davidfrantz/force` under the project/user GitHub account;
 2. create a versioned branch such as `terravault-v3.10.04`;
