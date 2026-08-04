@@ -11,7 +11,7 @@ build
 # The native FORCE build only needs its Dockerfile and pinned source tree.
 *
 !docker/
-!docker/force-arm64.Dockerfile
+!docker/force.Dockerfile
 !vendor/
 !vendor/force/
 !vendor/force/**

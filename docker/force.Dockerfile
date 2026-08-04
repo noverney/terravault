@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 
-# Native Apple-silicon build of the pinned FORCE submodule.  The upstream
-# image is amd64-only; building this image avoids Docker/QEMU emulation.
-FROM --platform=linux/arm64 ubuntu:24.04
+# Native Linux build of the pinned FORCE submodule. The same recipe builds on
+# linux/amd64 and linux/arm64; Apple Silicon runs the latter through Docker's
+# Linux VM without CPU-architecture emulation.
+FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -30,9 +31,10 @@ WORKDIR /src/force
 COPY vendor/force/ ./
 
 # FORCE 3.10.04 hard-codes Debian's x86_64 multiarch directory and its build
-# gate checks tools needed by unrelated FORCE modules.  Adapt the paths for
-# arm64 and limit that gate to dependencies required by TerraVault's L2PS and
-# mosaic workflow.  The pinned submodule itself remains unmodified.
+# gate checks tools needed by unrelated FORCE modules. Adapt the library paths
+# to the build architecture and limit that gate to dependencies required by
+# TerraVault's L2PS, external-feature, and mosaic workflows. The pinned
+# submodule itself remains unmodified.
 RUN multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
     && sed -i "s#x86_64-linux-gnu#${multiarch}#g" Makefile \
     && sed -i \

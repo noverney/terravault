@@ -97,7 +97,7 @@ the pinned submodule (the build does not modify `vendor/force`):
 
 ```bash
 docker build --platform linux/arm64 \
-  -f docker/force-arm64.Dockerfile \
+  -f docker/force.Dockerfile \
   -t terravault/force:3.10.04-arm64 .
 docker run --rm --platform linux/arm64 \
   terravault/force:3.10.04-arm64 force-info
@@ -115,13 +115,22 @@ Docker Desktop on an Intel Mac. TerraVault's runtime defaults are:
 
 | Host architecture | Default image | Container platform | Setup |
 |---|---|---|---|
-| ARM64 / aarch64 (Apple Silicon or ARM Linux) | `terravault/force:3.10.04-arm64` | `linux/arm64` | Build `docker/force-arm64.Dockerfile` locally |
+| ARM64 / aarch64 (Apple Silicon or ARM Linux) | `terravault/force:3.10.04-arm64` | `linux/arm64` | Build `docker/force.Dockerfile` locally |
 | Intel / AMD x86_64 (macOS or Linux) | `davidfrantz/force:3.10.04` | `linux/amd64` | Pull the official image; no TerraVault image build required |
 
 There is currently no published multi-architecture `terravault/force` image:
 the ARM64 tag is produced locally, while x86_64 uses the upstream image. A
 different architecture or private registry can be selected with
 `TERRAVAULT_FORCE_DOCKER_IMAGE` and `TERRAVAULT_FORCE_DOCKER_PLATFORM`.
+
+Two artifact-free GitHub Actions workflows continuously check the portable
+Dockerfile. `force-image-x64.yml` builds and smoke-tests `linux/amd64` on an
+x64 Ubuntu runner. `force-image-arm64.yml` builds and smoke-tests
+`linux/arm64` natively on GitHub's ARM64 Ubuntu runner—the image architecture
+used by Docker Desktop on Apple Silicon. GitHub's ARM64 macOS runners are not
+used because they do not support the nested virtualization required for a
+Linux Docker VM. The workflows neither push images nor call an artifact/cache
+action; their local Docker images disappear with the ephemeral runner.
 
 FORCE is developed and tested on Ubuntu; upstream does not support migrating
 it to other operating systems. `--runtime auto` therefore considers a native

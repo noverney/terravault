@@ -1,0 +1,60 @@
+name: FORCE image - ARM64 (Apple Silicon target)
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/force-image-arm64.yml
+      - docker/force.Dockerfile
+      - vendor/force
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/force-image-arm64.yml
+      - docker/force.Dockerfile
+      - vendor/force
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: force-image-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke-test:
+    # macOS ARM64 runners cannot run Docker's Linux VM because GitHub does not
+    # support nested virtualization. This native ARM64 Linux runner builds the
+    # exact linux/arm64 image consumed by Docker Desktop on Apple Silicon.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      IMAGE: terravault/force:3.10.04-arm64-ci
+    steps:
+      - name: Check out TerraVault and pinned FORCE
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build native linux/arm64 image
+        run: >-
+          docker build
+          --platform linux/arm64
+          --file docker/force.Dockerfile
+          --tag "$IMAGE"
+          .
+
+      - name: Verify architecture and FORCE commands
+        run: |
+          test "$(docker image inspect --format '{{.Architecture}}' "$IMAGE")" = arm64
+          docker run --rm --platform linux/arm64 "$IMAGE" sh -eu -c '
+            test "$(uname -m)" = aarch64
+            force-info | grep -F "FORCE v. 3.10.04"
+            command -v force-level2
+            command -v force-l2ps
+            command -v force-cube-init
+            command -v force-cube
+            command -v force-mosaic
+            ! grep -q -- "--eta" "$(command -v force-level2)"
+          '

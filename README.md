@@ -349,7 +349,7 @@ Apple Silicon this avoids the official image's AMD64/QEMU emulation):
 
 ```bash
 docker build --platform linux/arm64 \
-  -f docker/force-arm64.Dockerfile \
+  -f docker/force.Dockerfile \
   -t terravault/force:3.10.04-arm64 .
 ```
 

@@ -29,6 +29,8 @@ changes do not require rediscovering the repository.
 | `examples/query/` | Local DuckDB and stitched-COG API examples |
 | `examples/postprocessing/` | FORCE postprocessing orchestration |
 | `vendor/force/` | FORCE v3.10.04 source pinned as a Git submodule |
+| `docker/force.Dockerfile` | Native Linux FORCE image recipe for both amd64 and arm64 |
+| `.github/workflows/force-image-*.yml` | Artifact-free native amd64/arm64 image build and smoke tests |
 
 The core `Pipeline` is a STAC asset ingester. The Process API helpers are a
 separate path for generated subsets/mosaics. Do not treat the synchronous
