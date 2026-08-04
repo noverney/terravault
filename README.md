@@ -270,6 +270,12 @@ and validates its structure and transfer manifest. The roughly 847 MB test
 dataset exists only in the runner's temporary directory; the workflow uploads
 no artifact and does not expose the credentials to pull-request jobs.
 
+`Sentinel-2 L1C to FORCE - x64 end to end` adds the complete processing test:
+it builds the pinned FORCE image, downloads the same SAFE, runs native L2PS,
+and verifies every BOA, QAI and overview tile plus both mosaics and the durable
+job/progress metadata. It runs only on `main` or by manual dispatch, publishes
+nothing, uses no Actions cache and discards all imagery with the runner.
+
 Use the downloaded dataset directly from Python without contacting
 Copernicus:
 

@@ -1,0 +1,101 @@
+name: Sentinel-2 L1C to FORCE - x64 end to end
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/force-e2e-x64.yml
+      - scripts/ci/fetch_l1c_smoke.py
+      - scripts/ci/validate_force_l2_smoke.py
+      - docker/force.Dockerfile
+      - terravault/force_level2.py
+      - terravault/l1c_download.py
+      - terravault/s3_downloader.py
+      - vendor/force
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: force-e2e-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fetch-process-validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      IMAGE: terravault/force:3.10.04-amd64-e2e
+      TEST_ITEM_ID: S2B_MSIL1C_20260717T103029_N0512_R108_T32TMT_20260717T140459
+      TERRAVAULT_CDSE_S3_ACCESS_KEY: ${{ secrets.TERRAVAULT_CDSE_S3_ACCESS_KEY }}
+      TERRAVAULT_CDSE_S3_SECRET_KEY: ${{ secrets.TERRAVAULT_CDSE_S3_SECRET_KEY }}
+      TERRAVAULT_CDSE_S3_ENDPOINT: https://eodata.dataspace.copernicus.eu
+      TERRAVAULT_CDSE_S3_REGION: default
+    steps:
+      - name: Check out TerraVault and pinned FORCE
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify required secrets are available
+        shell: bash
+        run: |
+          test -n "$TERRAVAULT_CDSE_S3_ACCESS_KEY" || {
+            echo "Missing TERRAVAULT_CDSE_S3_ACCESS_KEY" >&2
+            exit 1
+          }
+          test -n "$TERRAVAULT_CDSE_S3_SECRET_KEY" || {
+            echo "Missing TERRAVAULT_CDSE_S3_SECRET_KEY" >&2
+            exit 1
+          }
+
+      - name: Install TerraVault with S3 support
+        run: python -m pip install -e ".[s3]"
+
+      - name: Build native linux/amd64 FORCE image
+        run: >-
+          docker build
+          --platform linux/amd64
+          --file docker/force.Dockerfile
+          --tag "$IMAGE"
+          .
+
+      - name: Fetch and validate complete Zurich L1C SAFE
+        run: >-
+          python scripts/ci/fetch_l1c_smoke.py
+          --item-id "$TEST_ITEM_ID"
+          --output-root "$RUNNER_TEMP/terravault-force-e2e"
+
+      - name: Run complete FORCE L1C to BOA/QAI processing
+        run: >-
+          terravault force-level2
+          --input "$RUNNER_TEMP/terravault-force-e2e/level1/$TEST_ITEM_ID.SAFE"
+          --output-root "$RUNNER_TEMP/terravault-force-e2e"
+          --mount-root "$RUNNER_TEMP/terravault-force-e2e"
+          --runtime docker
+          --docker-image "$IMAGE"
+          --docker-platform linux/amd64
+          --processes 1
+          --threads 2
+          --progress-interval-seconds 30
+
+      - name: Validate FORCE products and metadata
+        run: >-
+          python scripts/ci/validate_force_l2_smoke.py
+          --output-root "$RUNNER_TEMP/terravault-force-e2e"
+          --item-id "$TEST_ITEM_ID"
+
+      - name: Report ephemeral disk use
+        shell: bash
+        run: |
+          du -sh "$RUNNER_TEMP/terravault-force-e2e"
+          df -h "$RUNNER_TEMP"
+          echo "No artifact or registry upload is configured; runner data is discarded."
+
