@@ -263,6 +263,13 @@ asset keys, cron, state tables, retry behaviour and operations.
 See [`docs/DATASET_STORAGE.md`](docs/DATASET_STORAGE.md) for the partitioned
 layout, DuckDB schema, raster queries and log retention.
 
+The manually triggered `CDSE S3 fetch - Zurich L1C` GitHub Actions workflow
+checks the two repository secrets `TERRAVAULT_CDSE_S3_ACCESS_KEY` and
+`TERRAVAULT_CDSE_S3_SECRET_KEY`, downloads one complete known Zurich L1C SAFE,
+and validates its structure and transfer manifest. The roughly 847 MB test
+dataset exists only in the runner's temporary directory; the workflow uploads
+no artifact and does not expose the credentials to pull-request jobs.
+
 Use the downloaded dataset directly from Python without contacting
 Copernicus:
 
