@@ -1,6 +1,13 @@
 name: CDSE S3 fetch - Zurich L1C
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/cdse-s3-fetch.yml
+      - scripts/ci/fetch_l1c_smoke.py
+      - terravault/l1c_download.py
+      - terravault/s3_downloader.py
   workflow_dispatch:
 
 permissions:
@@ -58,4 +65,3 @@ jobs:
           test -f "$RUNNER_TEMP/terravault-cdse-fetch/fetch-result.json"
           python -m json.tool \
             "$RUNNER_TEMP/terravault-cdse-fetch/fetch-result.json"
-
