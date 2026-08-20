@@ -14,6 +14,12 @@ __all__ = [
     "ForceLevel2Processor",
     "ForceLevel2Result",
     "ForceLevel2Status",
+    "ForceDownloadOptions",
+    "ForceLevel2Options",
+    "ForcePipeline",
+    "ForcePipelineConfig",
+    "ForcePipelineDatabase",
+    "ForcePipelineResult",
     "ForcePostprocessor",
     "ForceResult",
     "ForceVisualizationConfig",
@@ -42,6 +48,7 @@ __all__ = [
     "load_roi",
     "inspect_force_level2_status",
     "parse_utc_date",
+    "run_force_pipeline",
 ]
 
 __version__ = "0.1.0"
@@ -118,6 +125,34 @@ def __getattr__(name: str):
             "ForceLevel2Result": ForceLevel2Result,
             "ForceLevel2Status": ForceLevel2Status,
             "inspect_force_level2_status": inspect_force_level2_status,
+        }[name]
+    if name in {
+        "ForceDownloadOptions",
+        "ForceLevel2Options",
+        "ForcePipeline",
+        "ForcePipelineConfig",
+        "ForcePipelineDatabase",
+        "ForcePipelineResult",
+        "run_force_pipeline",
+    }:
+        from .force_pipeline import (
+            ForceDownloadOptions,
+            ForceLevel2Options,
+            ForcePipeline,
+            ForcePipelineConfig,
+            ForcePipelineDatabase,
+            ForcePipelineResult,
+            run_force_pipeline,
+        )
+
+        return {
+            "ForceDownloadOptions": ForceDownloadOptions,
+            "ForceLevel2Options": ForceLevel2Options,
+            "ForcePipeline": ForcePipeline,
+            "ForcePipelineConfig": ForcePipelineConfig,
+            "ForcePipelineDatabase": ForcePipelineDatabase,
+            "ForcePipelineResult": ForcePipelineResult,
+            "run_force_pipeline": run_force_pipeline,
         }[name]
     if name in {
         "ForceVisualizationConfig",

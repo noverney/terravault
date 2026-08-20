@@ -533,6 +533,73 @@ class DatasetCatalog:
 
         self._write(operation)
 
+    def query_items(
+        self,
+        *,
+        bbox: tuple[float, float, float, float] | None = None,
+        start_datetime: datetime | None = None,
+        end_datetime: datetime | None = None,
+        include_incomplete: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return saved scene rows, including metadata paths, without requiring assets."""
+
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if not include_incomplete:
+            clauses.append("status = 'completed'")
+        if bbox is not None:
+            west, south, east, north = bbox
+            clauses.extend(
+                [
+                    "east >= ?",
+                    "west <= ?",
+                    "north >= ?",
+                    "south <= ?",
+                ]
+            )
+            parameters.extend([west, east, south, north])
+        if start_datetime is not None:
+            clauses.append("acquisition_time >= ?")
+            parameters.append(start_datetime)
+        if end_datetime is not None:
+            clauses.append("acquisition_time <= ?")
+            parameters.append(end_datetime)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"""
+            SELECT item_id, collection_id, acquisition_time, tile_id, status,
+                   attempts, last_error, west, south, east, north,
+                   geometry_json, cloud_cover, metadata_path, status_path
+              FROM items
+              {where}
+             ORDER BY acquisition_time, tile_id, item_id
+        """
+        with self._file_lock(exclusive=False):
+            connection = duckdb.connect(str(self.path), read_only=True)
+            try:
+                cursor = connection.execute(sql, parameters)
+                columns = [column[0] for column in cursor.description]
+                return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+            finally:
+                connection.close()
+
+    def dataset_info(self, key: str | None = None) -> dict[str, str] | str | None:
+        """Read one or all dataset metadata values."""
+
+        with self._file_lock(exclusive=False):
+            connection = duckdb.connect(str(self.path), read_only=True)
+            try:
+                if key is not None:
+                    row = connection.execute(
+                        "SELECT value FROM dataset_info WHERE key = ?", [key]
+                    ).fetchone()
+                    return None if row is None else str(row[0])
+                rows = connection.execute(
+                    "SELECT key, value FROM dataset_info ORDER BY key"
+                ).fetchall()
+                return {str(info_key): str(value) for info_key, value in rows}
+            finally:
+                connection.close()
+
     def query_raster_pieces(
         self,
         *,

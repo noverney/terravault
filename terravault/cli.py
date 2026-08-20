@@ -549,6 +549,135 @@ def cmd_force_visualize(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_force_pipeline(args: argparse.Namespace) -> int:
+    """Discover low-cloud Copernicus L1C scenes and process them with FORCE."""
+
+    from datetime import datetime, timezone
+
+    from .force_pipeline import (
+        ForceDownloadOptions,
+        ForceLevel2Options,
+        ForcePipeline,
+        ForcePipelineConfig,
+    )
+    from .historical import parse_utc_date
+    from .rolling import load_roi
+    from .s3_downloader import S3Config
+
+    try:
+        roi = load_roi(bbox=args.bbox, geojson_path=args.roi)
+        start = parse_utc_date(args.start_date)
+        end = (
+            datetime.now(timezone.utc)
+            if args.end_date is None
+            else parse_utc_date(args.end_date, inclusive_end=True)
+        )
+        env_auth = CDSEDownloadAuthConfig.from_env(os.environ)
+        s3_access = args.s3_access_key or os.environ.get(
+            "TERRAVAULT_CDSE_S3_ACCESS_KEY", ""
+        )
+        s3_secret = _s3_secret(args.s3_secret_key_file)
+        s3 = None
+        if s3_access and s3_secret:
+            s3 = S3Config(
+                access_key=s3_access,
+                secret_key=s3_secret,
+                endpoint_url=args.s3_endpoint
+                or os.environ.get(
+                    "TERRAVAULT_CDSE_S3_ENDPOINT",
+                    "https://eodata.dataspace.copernicus.eu",
+                ),
+                region_name=args.s3_region
+                or os.environ.get("TERRAVAULT_CDSE_S3_REGION", "default"),
+                chunk_size=args.download_chunk_mib * 1024 * 1024,
+            )
+        elif s3_access or s3_secret:
+            logging.getLogger(__name__).warning(
+                "Ignoring incomplete CDSE S3 credentials and trying the "
+                "authenticated Product ZIP route"
+            )
+
+        config = ForcePipelineConfig(
+            output_root=Path(args.output_root),
+            start_datetime=start,
+            end_datetime=end,
+            intersects=roi.geometry,
+            catalog_url=args.catalog_url,
+            max_cloud_cover=args.max_cloud_cover,
+            sensors=tuple(args.sensors),
+            max_scenes=args.max_scenes,
+            database_path=(
+                None if args.database is None else Path(args.database)
+            ),
+            queue_path=None if args.queue is None else Path(args.queue),
+            s3=s3,
+            auth=env_auth,
+            download=ForceDownloadOptions(
+                chunk_size=args.download_chunk_mib * 1024 * 1024,
+                max_retries=args.download_max_retries,
+                retry_base_seconds=args.download_retry_base_seconds,
+                quota_wait_seconds=args.download_quota_wait_seconds,
+            ),
+            force=ForceLevel2Options(
+                runtime=args.runtime,
+                docker_image=args.docker_image,
+                docker_platform=(
+                    None
+                    if args.docker_platform.lower() == "none"
+                    else args.docker_platform
+                ),
+                mount_root=(
+                    None if args.mount_root is None else Path(args.mount_root)
+                ),
+                target_crs=args.target_crs,
+                origin_lon=args.origin_lon,
+                origin_lat=args.origin_lat,
+                tile_size=args.tile_size,
+                resolution=args.resolution,
+                aoi_path=(
+                    None if args.force_aoi is None else Path(args.force_aoi)
+                ),
+                dem_path=None if args.dem is None else Path(args.dem),
+                max_cloud_cover_frame=args.max_cloud_cover_frame,
+                max_cloud_cover_tile=args.max_cloud_cover_tile,
+                processes=args.processes,
+                threads=args.threads,
+                parallel_reads=args.parallel_reads,
+                output_overview=not args.no_force_overview,
+                overwrite=args.overwrite,
+                retry_failed=args.retry_failed,
+                dry_run=args.dry_run,
+                progress_interval_seconds=args.progress_interval_seconds,
+            ),
+        )
+        with ForcePipeline(config) as pipeline:
+            result = pipeline.run(
+                download=not args.discover_only,
+                process=not (args.discover_only or args.download_only),
+            )
+    except KeyboardInterrupt:
+        print("Interrupted; durable download and FORCE state were retained.", file=sys.stderr)
+        return 130
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).exception("FORCE pipeline failed")
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    print(
+        f"FORCE pipeline {result.status} – discovered={result.discovered}"
+        f"  selected={result.selected}"
+        f"  downloaded={result.downloaded}"
+        f"  download_skips={result.downloads_skipped}"
+        f"  processed={result.processed}"
+        f"  processing_skips={result.processing_skipped}"
+        f"  database={result.database_path}"
+        f"  queue={result.queue_path}"
+    )
+    for error in result.errors:
+        print(f"  ERROR: {error}", file=sys.stderr)
+    return 1 if result.errors else 0
+
+
 def _cmd_force_level2(args: argparse.Namespace) -> int:
     import shlex
 
@@ -1573,6 +1702,195 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rotating log path (default: OUTPUT_ROOT/_terravault/logs/force.log)",
     )
     force_p.set_defaults(func=cmd_force)
+
+    # -------------------------------------------------------- force-pipeline
+    force_pipeline_p = sub.add_parser(
+        "force-pipeline",
+        help=(
+            "Select low-cloud Copernicus L1C scenes, download complete SAFE "
+            "products and run FORCE"
+        ),
+    )
+    force_pipeline_p.add_argument(
+        "--env-file",
+        default=".env",
+        metavar="PATH",
+        help="Optional .env file (default: .env)",
+    )
+    force_pipeline_roi = force_pipeline_p.add_mutually_exclusive_group(required=True)
+    force_pipeline_roi.add_argument(
+        "--bbox",
+        nargs=4,
+        type=float,
+        metavar=("WEST", "SOUTH", "EAST", "NORTH"),
+        help="WGS84 discovery bounding box",
+    )
+    force_pipeline_roi.add_argument(
+        "--roi",
+        metavar="GEOJSON",
+        help="WGS84 Polygon/MultiPolygon GeoJSON used for discovery",
+    )
+    force_pipeline_p.add_argument(
+        "--start-date",
+        required=True,
+        metavar="DATE",
+        help="Acquisition start date (YYYY-MM-DD or ISO-8601)",
+    )
+    force_pipeline_p.add_argument(
+        "--end-date",
+        default=None,
+        metavar="DATE",
+        help="Inclusive acquisition end date (default: now)",
+    )
+    force_pipeline_p.add_argument(
+        "--catalog-url",
+        default="https://stac.dataspace.copernicus.eu/v1",
+        help="STAC API root URL",
+    )
+    force_pipeline_p.add_argument(
+        "--max-cloud-cover",
+        type=float,
+        default=20.0,
+        metavar="PCT",
+        help="Catalogue cloud-cover ceiling applied before download (default: 20)",
+    )
+    force_pipeline_p.add_argument(
+        "--sensors",
+        nargs="+",
+        choices=("S2A", "S2B", "S2C"),
+        default=("S2A", "S2B", "S2C"),
+        metavar="SENSOR",
+        help="Sentinel-2 platforms to include (default: S2A S2B S2C)",
+    )
+    force_pipeline_p.add_argument(
+        "--max-scenes",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Optional safety cap retaining the N most recent matching scenes",
+    )
+    force_pipeline_p.add_argument(
+        "--output-root",
+        required=True,
+        metavar="DIR",
+        help="Root for L1C inputs, FORCE outputs, state, queue and catalogue",
+    )
+    force_pipeline_p.add_argument(
+        "--database",
+        default=None,
+        metavar="PATH",
+        help="Image catalogue path (default: OUTPUT_ROOT/force_images.duckdb)",
+    )
+    force_pipeline_p.add_argument(
+        "--queue",
+        default=None,
+        metavar="PATH",
+        help="FORCE queue path (default: OUTPUT_ROOT/level1/queue.txt)",
+    )
+    force_pipeline_mode = force_pipeline_p.add_mutually_exclusive_group()
+    force_pipeline_mode.add_argument(
+        "--discover-only",
+        action="store_true",
+        help="Only select and catalogue STAC items; do not download or process",
+    )
+    force_pipeline_mode.add_argument(
+        "--download-only",
+        action="store_true",
+        help="Download selected complete SAFE products without running FORCE",
+    )
+    force_pipeline_p.add_argument(
+        "--runtime",
+        choices=("auto", "native", "docker"),
+        default="auto",
+        help="FORCE runtime; auto uses native only on Linux, otherwise Docker",
+    )
+    force_pipeline_p.add_argument(
+        "--docker-image",
+        default=FORCE_DOCKER_IMAGE,
+        metavar="IMAGE",
+        help=f"FORCE container image (default: {FORCE_DOCKER_IMAGE})",
+    )
+    force_pipeline_p.add_argument(
+        "--docker-platform",
+        default=FORCE_DOCKER_PLATFORM,
+        metavar="PLATFORM",
+        help=f"Container platform; use none to omit (default: {FORCE_DOCKER_PLATFORM})",
+    )
+    force_pipeline_p.add_argument("--mount-root", default=None, metavar="DIR")
+    force_pipeline_p.add_argument("--target-crs", default="EPSG:2056", metavar="CRS")
+    force_pipeline_p.add_argument("--origin-lon", type=float, default=5.5, metavar="DEG")
+    force_pipeline_p.add_argument("--origin-lat", type=float, default=48.0, metavar="DEG")
+    force_pipeline_p.add_argument("--tile-size", type=int, default=30_000, metavar="UNITS")
+    force_pipeline_p.add_argument("--resolution", type=float, default=10, metavar="UNITS")
+    force_pipeline_p.add_argument(
+        "--force-aoi",
+        default=None,
+        metavar="VECTOR",
+        help="Optional FORCE cutline applied after radiometric correction",
+    )
+    force_pipeline_p.add_argument(
+        "--dem",
+        default=None,
+        metavar="RASTER",
+        help="Recommended DEM for atmosphere, shadows and topographic correction",
+    )
+    force_pipeline_p.add_argument(
+        "--max-cloud-cover-frame",
+        type=int,
+        default=100,
+        metavar="PCT",
+        help="FORCE post-detection whole-frame cloud ceiling (default: 100)",
+    )
+    force_pipeline_p.add_argument(
+        "--max-cloud-cover-tile",
+        type=int,
+        default=100,
+        metavar="PCT",
+        help="FORCE post-detection output-tile cloud ceiling (default: 100)",
+    )
+    force_pipeline_p.add_argument("--processes", type=int, default=1, metavar="N")
+    force_pipeline_p.add_argument("--threads", type=int, default=2, metavar="N")
+    force_pipeline_p.add_argument("--parallel-reads", action="store_true")
+    force_pipeline_p.add_argument("--no-force-overview", action="store_true")
+    force_pipeline_p.add_argument("--retry-failed", action="store_true")
+    force_pipeline_p.add_argument("--overwrite", action="store_true")
+    force_pipeline_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Download selected inputs, then validate/plan FORCE commands only",
+    )
+    force_pipeline_p.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+    )
+    force_pipeline_p.add_argument("--s3-access-key", default=None, metavar="KEY")
+    force_pipeline_p.add_argument(
+        "--s3-secret-key-file",
+        default=None,
+        metavar="PATH",
+        help="Read CDSE S3 secret from a file (prefer TERRAVAULT_CDSE_S3_SECRET_KEY)",
+    )
+    force_pipeline_p.add_argument("--s3-endpoint", default=None, metavar="URL")
+    force_pipeline_p.add_argument("--s3-region", default=None, metavar="REGION")
+    force_pipeline_p.add_argument("--download-chunk-mib", type=int, default=8, metavar="MIB")
+    force_pipeline_p.add_argument(
+        "--download-max-retries", type=int, default=5, metavar="N"
+    )
+    force_pipeline_p.add_argument(
+        "--download-retry-base-seconds", type=float, default=2.0, metavar="SECONDS"
+    )
+    force_pipeline_p.add_argument(
+        "--download-quota-wait-seconds", type=float, default=900.0, metavar="SECONDS"
+    )
+    force_pipeline_p.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Rotating log path (default: OUTPUT_ROOT/_terravault/logs/force-pipeline.log)",
+    )
+    force_pipeline_p.set_defaults(func=cmd_force_pipeline)
 
     # --------------------------------------------------------- force-level2
     force_l2_p = sub.add_parser(

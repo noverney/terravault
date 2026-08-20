@@ -51,6 +51,25 @@ This result is a FORCE-tiled external feature, not FORCE BOA/QAI.
 
 ## Native L1C → FORCE BOA/QAI
 
+To select inputs directly from Copernicus instead of saving each STAC Item by
+hand, use the bounded high-level pipeline:
+
+```bash
+terravault force-pipeline \
+  --bbox 5.96 45.82 10.49 47.81 \
+  --start-date 2026-07-01 \
+  --end-date 2026-07-31 \
+  --max-cloud-cover 20 \
+  --output-root /data/force-native \
+  --runtime docker \
+  --dem /data/reference/switzerland_dem.tif
+```
+
+This builds `force_images.duckdb` and the FORCE-compatible `level1/queue.txt` as
+it downloads/processes the selected products. `--discover-only` writes only
+the selection and metadata; `--download-only` stops after the complete SAFE
+pool and queue are ready.
+
 `force_level2.py` is the thin example wrapper for `terravault force-level2`.
 It accepts one complete Sentinel-2 L1C SAFE directory or SAFE ZIP:
 
@@ -99,11 +118,11 @@ it, FORCE runs with topographic correction disabled and reduced atmospheric
 and cloud-shadow quality. `_terravault/force-l2/cube.json` makes the grid
 immutable for the output root; a grid change requires a new root.
 
-One invocation processes one product. SAFE products may be run sequentially
+One `force-level2` invocation processes one product. SAFE products may be run sequentially
 under the same output root, but their publications stay isolated—even for the
 same date and sensor. This command does not generate a pooled acquisition or
-Switzerland-wide FORCE mosaic. It is also not connected to `watch` or
-`historic`; a native Swiss rolling scheduler remains future work.
+Switzerland-wide FORCE mosaic. `force-pipeline` schedules a bounded STAC
+selection, but is not a continuous `watch` or `historic` worker.
 
 The same local-SAFE operation is available as a Python API:
 

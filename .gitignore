@@ -212,6 +212,7 @@ __marimo__/
 # TerraVault local retrieval example outputs
 examples/switzerland_patch/data/*
 !examples/switzerland_patch/data/.gitkeep
+artifacts/
 satellite_data/
 terravault_state.db*
 terravault_rolling.db*

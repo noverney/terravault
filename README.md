@@ -315,13 +315,16 @@ block under `--warp-memory-mib`. See
 ### FORCE postprocessing
 
 FORCE is pinned as the `vendor/force` Git submodule. TerraVault exposes two
-separate workflows:
+processing paths and one end-to-end wrapper:
 
 1. `terravault force` imports a stitched, already processed L2A raster into a
    FORCE external-feature cube. It does not create BOA/QAI.
 2. `terravault force-level2` gives one complete Sentinel-2 L1C SAFE product to
    native FORCE L2PS, which performs atmospheric correction and creates real
    BOA and bit-packed QAI products.
+3. `terravault force-pipeline` discovers L1C products in Copernicus by
+   AOI/date/sensor/cloud cover, downloads the complete selected SAFE products,
+   runs `force-level2` for each one, and catalogues every local input/output.
 
 Selected L2A JP2 files, a four-band L2A COG, and Process API exports are not
 valid L2PS inputs. A local input must be a complete
@@ -392,6 +395,60 @@ terravault force-level2 \
   --dem /data/dem/switzerland_dem.tif
 ```
 
+For an integrated bounded run, give the same discovery policy that FORCE's
+Level-1 archiving workflow normally uses:
+
+```bash
+terravault force-pipeline \
+  --bbox 5.96 45.82 10.49 47.81 \
+  --start-date 2026-07-01 \
+  --end-date 2026-07-31 \
+  --max-cloud-cover 20 \
+  --sensors S2A S2B S2C \
+  --output-root /data/terravault/force-native \
+  --runtime docker \
+  --dem /data/dem/switzerland_dem.tif
+```
+
+`--max-cloud-cover` is the Copernicus catalogue estimate and prevents unwanted
+complete SAFE downloads. FORCE then calculates its own cloud mask during L2PS;
+`--max-cloud-cover-frame` and `--max-cloud-cover-tile` optionally reject a
+whole scene or suppress individual output tiles after that calculation. The
+wrapper also applies FORCE's duplicate rule: for the same acquisition and
+MGRS tile it keeps the highest processing baseline, then the latest production.
+
+Every run creates `OUTPUT_ROOT/force_images.duckdb`, a DuckDB catalogue containing
+the selected STAC scene, local SAFE, BOA, QAI, overview and mosaic paths. It
+also creates the standard `OUTPUT_ROOT/level1/queue.txt` with `QUEUED`, `DONE`
+or `FAIL` states. Use `--discover-only` to inspect selection without transferring
+pixels, or `--download-only` to build the Level-1 pool and queue first.
+
+The common path is also a small Python API:
+
+```python
+from datetime import datetime, timezone
+
+from terravault import run_force_pipeline
+
+result = run_force_pipeline(
+    output_root="/data/terravault/force-native",
+    start_datetime=datetime(2026, 7, 1, tzinfo=timezone.utc),
+    end_datetime=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    bbox=(5.96, 45.82, 10.49, 47.81),
+    max_cloud_cover=20,
+    dem_path="/data/dem/switzerland_dem.tif",
+    runtime="docker",
+    processes=1,
+    threads=2,
+)
+
+print(result.database_path, result.queue_path, result.image_paths)
+```
+
+For complete control, construct `ForcePipelineConfig` with nested
+`ForceDownloadOptions` and `ForceLevel2Options`. See
+[`docs/FORCE_PIPELINE.md`](docs/FORCE_PIPELINE.md).
+
 Swiss defaults are EPSG:2056, 10 m pixels, 30 km tiles, and a stable grid
 origin at 5.5° E / 48° N. A DEM is strongly recommended: without one FORCE
 continues with topographic correction disabled and reduced atmospheric and
@@ -415,8 +472,9 @@ and a SHA-256 for every local object before swapping the staged directory into
 download manifests without content hashes are rebuilt once instead of being
 trusted from sizes alone.
 
-`force-level2` is the restartable per-product primitive. It is not yet wired
-into `watch` or `historic` as an active Swiss L1C/FORCE scheduler.
+`force-level2` remains the restartable per-product primitive.
+`force-pipeline` adds bounded L1C discovery and sequential scheduling; it is
+not a continuous `watch` or gradual `historic` worker.
 `--download-max-retries` controls complete-product attempts; CDSE
 `Retry-After` values are honoured between attempts (with a configurable
 15-minute fallback). Ctrl-C and SIGTERM terminate the active native process
@@ -502,6 +560,7 @@ Commands:
   query        Query local georeferenced raster pieces from dataset DuckDB
   extract      Stream intersecting pieces into one multiband COG
   force        Import a stitched raster into a FORCE feature datacube
+  force-pipeline  Discover, download, catalogue and process Copernicus L1C scenes
   force-level2 Run native FORCE L2PS on a complete Sentinel-2 L1C SAFE
   force-visualize  Create an NDVI COG and color quicklook from FORCE
   collections  List collections available in the STAC catalog

@@ -28,6 +28,20 @@ python examples/switzerland_patch/build_switzerland_overview.py \
 This combines public CDSE STAC thumbnails into a large JPEG and writes a JSON
 source manifest. It is a quicklook only, not a geospatial analysis raster.
 
+To verify the exact metadata-only selection already stored in DuckDB, avoid a
+second catalogue query:
+
+```bash
+python examples/switzerland_patch/build_switzerland_overview.py \
+  --dataset-db satellite_data/dataset.duckdb \
+  --max-cloud-cover 20 \
+  --width 2400
+```
+
+This reads completed item rows plus their saved STAC documents, selects the
+latest near-full-footprint item per tile, builds the thumbnail mosaic, and
+records the overview paths and source item IDs in `dataset_info`.
+
 ### All documented L2A Process API layers
 
 First generate and inspect the request bodies without using credentials or
@@ -148,10 +162,11 @@ directory. The previous verified publication stays available until the exact
 object list, sizes, per-object SHA-256 values, SAFE hierarchy, and all 13 L1C
 bands pass validation; only then is the staged directory promoted.
 
-This command does not build an acquisition-level or national native FORCE
-mosaic, and it is not integrated into `watch` or `historic`. It is the durable
-per-product primitive around which L1C discovery, scheduling, and downstream
-pooling still need to be built.
+`force-level2` does not build an acquisition-level or national native FORCE
+mosaic. The bounded `force-pipeline` wrapper now supplies L1C discovery,
+cloud/date/sensor selection, sequential scheduling, a standard FORCE queue,
+and `force_images.duckdb`; it still does not pool separate SAFE publications into
+one national mosaic or act as a continuous `watch`/`historic` worker.
 
 For a controlled cloud-mask comparison, `force-visualize --force-qai` aligns a
 matching FORCE QAI mosaic and creates a three-panel raw/CDSE/FORCE diagnostic.

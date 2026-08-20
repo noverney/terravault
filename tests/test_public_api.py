@@ -105,3 +105,23 @@ def test_native_force_level2_imports_are_public():
     assert L1CDownloadConfig is not None
     assert L1CDownloadResult is not None
     assert L1CProductDownloader is not None
+
+
+def test_high_level_force_pipeline_imports_are_public():
+    from terravault import (
+        ForceDownloadOptions,
+        ForceLevel2Options,
+        ForcePipeline,
+        ForcePipelineConfig,
+        ForcePipelineDatabase,
+        ForcePipelineResult,
+        run_force_pipeline,
+    )
+
+    assert ForceDownloadOptions is not None
+    assert ForceLevel2Options is not None
+    assert ForcePipeline is not None
+    assert ForcePipelineConfig is not None
+    assert ForcePipelineDatabase is not None
+    assert ForcePipelineResult is not None
+    assert run_force_pipeline is not None

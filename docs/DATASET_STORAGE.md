@@ -139,6 +139,7 @@ database = Path("satellite_data/switzerland_ndvi/dataset.duckdb")
 catalog = DatasetCatalog(database)
 
 print(catalog.summary())
+print(catalog.query_items())  # Saved scenes, including metadata paths.
 pieces = catalog.query_raster_pieces(
     bbox=(8.45, 47.20, 8.65, 47.35),
     asset_keys=("B04_10m", "B08_10m", "SCL_20m", "CLD_20m"),

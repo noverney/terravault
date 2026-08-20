@@ -120,6 +120,24 @@ python examples/switzerland_patch/build_switzerland_overview.py \
   --width 4000
 ```
 
+If a metadata-only rolling run already created `dataset.duckdb`, render the
+exact completed scenes stored there without repeating the STAC query:
+
+```bash
+python examples/switzerland_patch/build_switzerland_overview.py \
+  --dataset-db artifacts/switzerland_cloud20/dataset.duckdb \
+  --database-selection all \
+  --max-cloud-cover 20 \
+  --width 2400 \
+  --output artifacts/switzerland_cloud20/switzerland_overview.jpg
+```
+
+The same command accepts a `force_images.duckdb` produced by
+`terravault force-pipeline`. `--database-selection all` paints every stored
+scene; the default `latest-per-tile` keeps one representative per MGRS tile.
+The overview and manifest paths, item IDs and cloud threshold are registered
+back into either database.
+
 For a georeferenced, feature-selected result, use `terravault extract` against
 downloaded native pieces.
 

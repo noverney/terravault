@@ -98,6 +98,15 @@ def test_duckdb_catalog_queries_partitioned_raster_paths(tmp_path):
     assert pieces[0]["source_checksum"] == "1220source"
     assert not catalog.query_raster_pieces(bbox=(0, 0, 1, 1))
     assert catalog.summary()["completed_bytes"] == 1234
+    items = catalog.query_items(bbox=(8.2, 46.2, 8.4, 46.4))
+    assert len(items) == 1
+    assert items[0]["item_id"] == item.id
+    assert items[0]["metadata_path"] == str(metadata_path.resolve())
+    assert items[0]["cloud_cover"] == 12.5
+    assert catalog.query_items(bbox=(0, 0, 1, 1)) == []
+    catalog.set_dataset_info("overview_path", "/tmp/overview.jpg")
+    assert catalog.dataset_info("overview_path") == "/tmp/overview.jpg"
+    assert catalog.dataset_info()["schema_version"] == "2"
 
     connection = duckdb.connect(str(database), read_only=True)
     try:
