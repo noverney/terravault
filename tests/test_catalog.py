@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 
 import pystac
 
-from terravault.catalog import CatalogClient, SWITZERLAND_BBOX, DEFAULT_COLLECTIONS
+from terravault.catalog import (
+    CATALOG_RETRY_STATUS_CODES,
+    DEFAULT_COLLECTIONS,
+    CatalogClient,
+    SWITZERLAND_BBOX,
+)
 
 
 def _make_item(
@@ -54,6 +59,18 @@ class TestCatalogClientInit(unittest.TestCase):
         client = CatalogClient(bbox=[6, 45, 11, 48], intersects=geometry)
         self.assertIsNone(client.bbox)
         self.assertEqual(client.intersects, geometry)
+
+    @patch("terravault.catalog.pystac_client.Client.open")
+    def test_open_client_retries_rate_limits_and_transient_errors(self, mocked_open):
+        client = CatalogClient(catalog_url="https://example.com")
+
+        client._open_client()
+
+        stac_io = mocked_open.call_args.kwargs["stac_io"]
+        retry = stac_io.session.get_adapter("https://").max_retries
+        self.assertEqual(set(retry.status_forcelist), set(CATALOG_RETRY_STATUS_CODES))
+        self.assertIn("POST", retry.allowed_methods)
+        self.assertTrue(retry.respect_retry_after_header)
 
 
 class TestFormatDatetimeInterval(unittest.TestCase):

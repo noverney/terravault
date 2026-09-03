@@ -289,6 +289,44 @@ def test_force_pipeline_cli_exposes_selection_and_useful_force_options(tmp_path)
     )
 
 
+def test_force_pipeline_cli_process_only_is_mutually_exclusive(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "force-pipeline",
+            "--bbox",
+            "5.96",
+            "45.82",
+            "10.49",
+            "47.81",
+            "--start-date",
+            "2026-07-01",
+            "--output-root",
+            str(tmp_path / "force"),
+            "--process-only",
+        ]
+    )
+
+    assert args.process_only is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "force-pipeline",
+                "--bbox",
+                "5.96",
+                "45.82",
+                "10.49",
+                "47.81",
+                "--start-date",
+                "2026-07-01",
+                "--output-root",
+                str(tmp_path / "force"),
+                "--process-only",
+                "--download-only",
+            ]
+        )
+
+
 def test_interruption_is_reflected_in_database_and_force_queue(tmp_path):
     item = _item()
     config = _config(tmp_path)

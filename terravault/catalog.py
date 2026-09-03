@@ -12,6 +12,8 @@ from typing import Any, Iterator
 
 import pystac
 import pystac_client
+from pystac_client.stac_api_io import StacApiIO
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,7 @@ SWITZERLAND_BBOX: list[float] = [5.96, 45.82, 10.49, 47.81]
 DEFAULT_COLLECTIONS: list[str] = ["sentinel-2-l2a", "sentinel-2-l1c"]
 
 DEFAULT_MAX_CLOUD_COVER: float = 20.0
+CATALOG_RETRY_STATUS_CODES: tuple[int, ...] = (429, 500, 502, 503, 504)
 
 
 class CatalogClient:
@@ -69,7 +72,19 @@ class CatalogClient:
 
     def _open_client(self) -> pystac_client.Client:
         """Open a ``pystac_client.Client`` session."""
-        return pystac_client.Client.open(self.catalog_url)
+        retry = Retry(
+            total=6,
+            connect=6,
+            read=6,
+            status=6,
+            backoff_factor=2.0,
+            status_forcelist=CATALOG_RETRY_STATUS_CODES,
+            allowed_methods=frozenset(("GET", "POST")),
+            respect_retry_after_header=True,
+            raise_on_status=True,
+        )
+        stac_io = StacApiIO(max_retries=retry, timeout=(15.0, 120.0))
+        return pystac_client.Client.open(self.catalog_url, stac_io=stac_io)
 
     @staticmethod
     def _format_datetime_interval(start: datetime, end: datetime) -> str:

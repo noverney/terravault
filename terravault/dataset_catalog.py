@@ -639,7 +639,7 @@ class DatasetCatalog:
         sql = f"""
             SELECT
                 i.item_id, i.collection_id, i.acquisition_time, i.tile_id,
-                i.west, i.south, i.east, i.north, i.geometry_json,
+                i.west, i.south, i.east, i.north, i.geometry_json, i.cloud_cover,
                 a.asset_key, a.local_path, a.status, a.resolution_m,
                 a.proj_epsg, a.proj_shape_json, a.proj_transform_json,
                 a.proj_bbox_json, a.bands_json, a.nodata, a.data_type,

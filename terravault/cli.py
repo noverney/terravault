@@ -365,6 +365,302 @@ def cmd_historic(args: argparse.Namespace) -> int:
     return 1 if result.errors or result.failed or result.retired else 0
 
 
+def cmd_monthly(args: argparse.Namespace) -> int:
+    from .catalog import SWITZERLAND_BBOX
+    from .monthly import (
+        MonthlyCompositeConfig,
+        MonthlyCompositeProcessor,
+        discover_force_month,
+    )
+    from .rolling import load_roi
+
+    try:
+        bbox = list(SWITZERLAND_BBOX) if args.bbox is None and args.roi is None else args.bbox
+        roi = load_roi(bbox=bbox, geojson_path=args.roi)
+        if args.inventory_only:
+            summaries = [
+                discover_force_month(
+                    year=args.year,
+                    month=month,
+                    force_db=args.force_db,
+                ).to_dict()
+                for month in args.months
+            ]
+            print(json.dumps(summaries[0] if len(summaries) == 1 else summaries, indent=2))
+            return 0
+
+        results = []
+        for month in args.months:
+            result = MonthlyCompositeProcessor(
+                MonthlyCompositeConfig(
+                    force_db=Path(args.force_db),
+                    output_root=Path(args.output_root),
+                    year=args.year,
+                    month=month,
+                    bbox=roi.bbox,
+                    cutline_path=None if args.roi is None else Path(args.roi),
+                    target_crs=args.target_crs,
+                    resolution=args.resolution,
+                    qai_mask=args.qai_mask,
+                    compression=args.compression,
+                    warp_memory_mib=args.warp_memory_mib,
+                    max_output_gib=args.max_output_gib,
+                    overwrite=args.overwrite,
+                    dry_run=args.dry_run,
+                    allow_incomplete_month=args.allow_incomplete_month,
+                )
+            ).run()
+            results.append(result)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).exception("Monthly composite failed")
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    for result in results:
+        action = "planned" if result.dry_run else "complete"
+        timings = result.timings_seconds
+        print(
+            f"Post-FORCE monthly composite {action} – scenes={result.scene_count}"
+            f"  skipped={result.skipped_scene_count}"
+            f"  size={result.width}x{result.height}"
+            f"  estimated_uncompressed_gib="
+            f"{result.estimated_uncompressed_bytes / (1024**3):.2f}"
+            f"  mosaic_seconds={timings['monthly_mosaic_generation']:.1f}"
+            f"  four_indices_seconds={timings['index_calculation']:.1f}"
+            f"  total_seconds={timings['total']:.1f}"
+            f"  reflectance={result.reflectance_path}"
+            f"  indices={result.indices_path}"
+            f"  manifest={result.manifest_path}"
+        )
+    return 0
+
+
+def cmd_swisseo(args: argparse.Namespace) -> int:
+    from .swisseo import (
+        SwissEOClient,
+        SwissEOImageConfig,
+        SwissEOImageProcessor,
+        discover_swisseo_month,
+    )
+
+    try:
+        client = SwissEOClient(stac_url=args.stac_url, collection=args.collection)
+        if args.list_month is not None:
+            parts = args.list_month.split("-")
+            if len(parts) != 2:
+                raise ValueError("--list-month must be YYYY-MM")
+            year, month = (int(value) for value in parts)
+            result = discover_swisseo_month(year=year, month=month, client=client)
+            print(json.dumps(result.to_dict(), indent=2))
+            return 0
+
+        result = SwissEOImageProcessor(
+            SwissEOImageConfig(
+                item_id=args.item_id,
+                output_root=Path(args.output_root),
+                stac_url=args.stac_url,
+                collection=args.collection,
+                resolution=args.resolution,
+                target_crs=args.target_crs,
+                mask_cloud_and_shadow=not args.keep_cloud_shadow,
+                mask_terrain_shadow=not args.keep_terrain_shadow,
+                compression=args.compression,
+                warp_memory_mib=args.warp_memory_mib,
+                max_output_gib=args.max_output_gib,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            ),
+            client=client,
+        ).run()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).exception("swissEO image processing failed")
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    action = "planned" if result.dry_run else "complete"
+    print(
+        f"swissEO image indices {action} – size={result.width}x{result.height}"
+        f"  elapsed_seconds={result.elapsed_seconds:.1f}"
+        f"  reflectance={result.reflectance_path}"
+        f"  indices={result.indices_path}"
+        f"  manifest={result.manifest_path}"
+    )
+    return 0
+
+
+def cmd_copernicus_monthly(args: argparse.Namespace) -> int:
+    """Build direct monthly L2A composites from the local CDSE catalogue."""
+
+    from .catalog import SWITZERLAND_BBOX
+    from .copernicus_monthly import CopernicusMonthlyConfig, CopernicusMonthlyProcessor
+    from .rolling import load_roi
+
+    try:
+        bbox = list(SWITZERLAND_BBOX) if args.bbox is None and args.roi is None else args.bbox
+        roi = load_roi(bbox=bbox, geojson_path=args.roi)
+        results = [
+            CopernicusMonthlyProcessor(
+                CopernicusMonthlyConfig(
+                    dataset_db=Path(args.dataset_db),
+                    output_root=Path(args.output_root),
+                    year=args.year,
+                    month=month,
+                    bbox=roi.bbox,
+                    cutline_path=None if args.roi is None else Path(args.roi),
+                    target_crs=args.target_crs,
+                    resolution=args.resolution,
+                    max_cloud_cover=args.max_cloud_cover,
+                    cloud_probability_threshold=args.cloud_probability_threshold,
+                    compression=args.compression,
+                    warp_memory_mib=args.warp_memory_mib,
+                    max_output_gib=args.max_output_gib,
+                    overwrite=args.overwrite,
+                    dry_run=args.dry_run,
+                    allow_incomplete_month=args.allow_incomplete_month,
+                    staging_root=(
+                        None if args.staging_root is None else Path(args.staging_root)
+                    ),
+                )
+            ).run()
+            for month in args.months
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).exception("Direct Copernicus monthly composite failed")
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    for result in results:
+        action = "planned" if result.dry_run else "complete"
+        timings = result.timings_seconds
+        print(
+            f"Direct Copernicus monthly composite {action} – scenes={result.scene_count}"
+            f"  size={result.width}x{result.height}"
+            f"  mosaic_seconds={timings['monthly_mosaic_generation']:.1f}"
+            f"  four_indices_seconds={timings['index_calculation']:.1f}"
+            f"  total_seconds={timings['total']:.1f}"
+            f"  reflectance={result.reflectance_path}"
+            f"  indices={result.indices_path}"
+            f"  manifest={result.manifest_path}"
+        )
+    return 0
+
+
+def cmd_swisseo_monthly(args: argparse.Namespace) -> int:
+    """Build a monthly median from all public swissEO orbit mosaics."""
+
+    from .catalog import SWITZERLAND_BBOX
+    from .rolling import load_roi
+    from .swisseo import SwissEOClient
+    from .swisseo_monthly import SwissEOMonthlyConfig, SwissEOMonthlyProcessor
+
+    try:
+        bbox = list(SWITZERLAND_BBOX) if args.bbox is None and args.roi is None else args.bbox
+        roi = load_roi(bbox=bbox, geojson_path=args.roi)
+        client = SwissEOClient(stac_url=args.stac_url, collection=args.collection)
+        results = [
+            SwissEOMonthlyProcessor(
+                SwissEOMonthlyConfig(
+                    output_root=Path(args.output_root),
+                    year=args.year,
+                    month=month,
+                    bbox=roi.bbox,
+                    cutline_path=None if args.roi is None else Path(args.roi),
+                    stac_url=args.stac_url,
+                    collection=args.collection,
+                    target_crs=args.target_crs,
+                    resolution=args.resolution,
+                    compression=args.compression,
+                    warp_memory_mib=args.warp_memory_mib,
+                    max_output_gib=args.max_output_gib,
+                    max_temporary_gib=args.max_temporary_gib,
+                    temporary_root=(
+                        None if args.temporary_root is None else Path(args.temporary_root)
+                    ),
+                    publication_wait_seconds=args.publication_wait_seconds,
+                    overwrite=args.overwrite,
+                    dry_run=args.dry_run,
+                    allow_incomplete_month=args.allow_incomplete_month,
+                ),
+                client=client,
+            ).run()
+            for month in args.months
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).exception("Monthly swissEO composite failed")
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    for result in results:
+        action = "planned" if result.dry_run else "complete"
+        timings = result.timings_seconds
+        print(
+            f"Monthly swissEO composite {action} – items={result.item_count}"
+            f"  size={result.width}x{result.height}"
+            f"  peak_temp_gib={result.estimated_peak_temporary_bytes / (1024**3):.1f}"
+            f"  mosaic_seconds={timings['monthly_mosaic_generation']:.1f}"
+            f"  four_indices_seconds={timings['index_calculation']:.1f}"
+            f"  total_seconds={timings['total']:.1f}"
+            f"  reflectance={result.reflectance_path}"
+            f"  indices={result.indices_path}"
+            f"  manifest={result.manifest_path}"
+        )
+    return 0
+
+
+def cmd_compare_monthly(args: argparse.Namespace) -> int:
+    """Render a complete selected-source × month × index comparison."""
+
+    from .comparison import (
+        ComparisonConfig,
+        MonthlyComparisonRenderer,
+        discover_comparison_products,
+    )
+    from .rolling import load_roi
+
+    try:
+        roi = load_roi(bbox=None, geojson_path=args.roi)
+        products = discover_comparison_products(
+            year=args.year,
+            months=args.months,
+            copernicus_root=args.copernicus_root,
+            force_root=args.force_root,
+            swisseo_root=args.swisseo_root,
+            sources=args.sources,
+        )
+        result = MonthlyComparisonRenderer(
+            ComparisonConfig(
+                products=products,
+                output_root=Path(args.output_root),
+                bbox=roi.bbox,
+                cutline_path=Path(args.roi),
+                target_crs=args.target_crs,
+                analysis_resolution=args.analysis_resolution,
+                preview_width=args.preview_width,
+                atlas_width=args.atlas_width,
+                atlas_height=args.atlas_height,
+                histogram_bins=args.histogram_bins,
+                overwrite=args.overwrite,
+            )
+        ).run()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).exception("Monthly comparison rendering failed")
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    print(
+        "Monthly comparison complete"
+        f"  mosaics={len(result.mosaic_paths)}"
+        f"  index_maps={len(result.index_map_paths)}"
+        f"  index_tiffs={len(result.index_tiff_paths)}"
+        f"  atlas={result.atlas_path}"
+        f"  source_overviews={len(result.source_overview_paths)}"
+        f"  report_manifest={result.report_manifest_path}"
+        f"  statistics_json={result.statistics_json_path}"
+        f"  statistics_csv={result.statistics_csv_path}"
+    )
+    return 0
+
+
 def cmd_query(args: argparse.Namespace) -> int:
     from .dataset_catalog import DatasetCatalog
     from .historical import parse_utc_date
@@ -652,7 +948,7 @@ def cmd_force_pipeline(args: argparse.Namespace) -> int:
         )
         with ForcePipeline(config) as pipeline:
             result = pipeline.run(
-                download=not args.discover_only,
+                download=not (args.discover_only or args.process_only),
                 process=not (args.discover_only or args.download_only),
             )
     except KeyboardInterrupt:
@@ -1056,11 +1352,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch_p.add_argument(
         "--asset-profile",
-        choices=("native", "ndvi", "metadata-only"),
+        choices=("native", "ndvi", "vegetation", "metadata-only"),
         default="native",
         help=(
-            "native downloads all canonical L2A layers; ndvi downloads B04, B08, "
-            "SCL and CLD (default: native)"
+            "native downloads all canonical L2A layers; ndvi downloads B04/B08; "
+            "vegetation downloads the six bands plus SCL/CLD for direct monthly "
+            "four-index composites (default: native)"
         ),
     )
     watch_p.add_argument(
@@ -1247,11 +1544,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     historic_p.add_argument(
         "--asset-profile",
-        choices=("native", "ndvi", "metadata-only"),
+        choices=("native", "ndvi", "vegetation", "metadata-only"),
         default="native",
         help=(
-            "native downloads the complete L2A profile; ndvi downloads B04, B08, "
-            "SCL and CLD (default: native)"
+            "native downloads the complete L2A profile; ndvi downloads B04/B08; "
+            "vegetation downloads the six bands plus SCL/CLD for direct monthly "
+            "four-index composites (default: native)"
         ),
     )
     historic_p.add_argument(
@@ -1372,6 +1670,378 @@ def build_parser() -> argparse.ArgumentParser:
         help="Streaming/resume chunk size in MiB (default: 8)",
     )
     historic_p.set_defaults(func=cmd_historic)
+
+    # -------------------------------------------------------------- monthly
+    monthly_p = sub.add_parser(
+        "monthly",
+        help="Build a QAI-screened monthly composite from native FORCE BOA",
+    )
+    monthly_p.add_argument("--env-file", default=".env", metavar="PATH")
+    monthly_p.add_argument("--year", type=int, required=True, metavar="YYYY")
+    monthly_p.add_argument(
+        "--months",
+        nargs="+",
+        type=int,
+        default=[6, 7, 8],
+        metavar="MM",
+        help="Calendar months to process (default: 6 7 8)",
+    )
+    monthly_roi = monthly_p.add_mutually_exclusive_group()
+    monthly_roi.add_argument(
+        "--bbox",
+        nargs=4,
+        type=float,
+        metavar=("WEST", "SOUTH", "EAST", "NORTH"),
+        help="WGS84 extent (default: Switzerland bounding box)",
+    )
+    monthly_roi.add_argument(
+        "--roi",
+        metavar="GEOJSON",
+        help="Exact Swiss Polygon/MultiPolygon used for national clipping",
+    )
+    monthly_p.add_argument(
+        "--force-db",
+        default="satellite_data/force-native/force_images.duckdb",
+        metavar="PATH",
+        help="DuckDB written by force-pipeline with BOA_MOSAIC/QAI_MOSAIC rows",
+    )
+    monthly_p.add_argument(
+        "--output-root",
+        default="satellite_data/force-monthly",
+        metavar="DIR",
+        help="Derived post-FORCE monthly product root",
+    )
+    monthly_p.add_argument(
+        "--inventory-only",
+        action="store_true",
+        help="List paired completed FORCE BOA/QAI acquisitions without processing pixels",
+    )
+    monthly_p.add_argument("--target-crs", default="EPSG:2056", metavar="CRS")
+    monthly_p.add_argument(
+        "--resolution",
+        type=float,
+        default=10.0,
+        metavar="METRES",
+        help="Output pixel size (default: 10, the configured FORCE cube grid)",
+    )
+    monthly_p.add_argument(
+        "--qai-mask",
+        type=_integer_literal,
+        default=0x031F,
+        metavar="BITS",
+        help="Invalid FORCE QAI bits (default: 0x031F)",
+    )
+    monthly_p.add_argument("--compression", default="DEFLATE", metavar="CODEC")
+    monthly_p.add_argument("--warp-memory-mib", type=int, default=256, metavar="MIB")
+    monthly_p.add_argument("--max-output-gib", type=float, default=64.0, metavar="GIB")
+    monthly_p.add_argument("--dry-run", action="store_true")
+    monthly_p.add_argument("--allow-incomplete-month", action="store_true")
+    monthly_p.add_argument("--overwrite", action="store_true")
+    monthly_p.add_argument("--log-file", default=None, metavar="PATH")
+    monthly_p.set_defaults(func=cmd_monthly)
+
+    # -------------------------------------------------------------- swissEO
+    swisseo_p = sub.add_parser(
+        "swisseo-image",
+        help="Calculate indices from one published swissEO S2-SR orbit mosaic",
+    )
+    swisseo_p.add_argument("--env-file", default=".env", metavar="PATH")
+    swisseo_input = swisseo_p.add_mutually_exclusive_group(required=True)
+    swisseo_input.add_argument(
+        "--item-id",
+        metavar="ID",
+        help="Exact swissEO STAC item, e.g. 2024-06-04t101559",
+    )
+    swisseo_input.add_argument(
+        "--list-month",
+        metavar="YYYY-MM",
+        help="List orbit mosaics in a month; does not choose one automatically",
+    )
+    swisseo_p.add_argument(
+        "--stac-url",
+        default="https://data.geo.admin.ch/api/stac/v1",
+        metavar="URL",
+        help="Public swisstopo STAC API (no token required)",
+    )
+    swisseo_p.add_argument(
+        "--collection",
+        default="ch.swisstopo.swisseo_s2-sr_v100",
+        metavar="ID",
+    )
+    swisseo_p.add_argument(
+        "--output-root",
+        default="satellite_data/swisseo-indices",
+        metavar="DIR",
+    )
+    swisseo_p.add_argument("--target-crs", default="EPSG:2056", metavar="CRS")
+    swisseo_p.add_argument(
+        "--resolution",
+        type=float,
+        default=20.0,
+        metavar="METRES",
+        help="Output pixel size (default: 20 because B05/B8A/B11 are 20 m)",
+    )
+    swisseo_p.add_argument(
+        "--keep-cloud-shadow",
+        action="store_true",
+        help="Do not screen swissEO cloud/cloud-shadow mask value 1",
+    )
+    swisseo_p.add_argument(
+        "--keep-terrain-shadow",
+        action="store_true",
+        help="Do not screen swissEO terrain-shadow mask value 100",
+    )
+    swisseo_p.add_argument("--compression", default="DEFLATE", metavar="CODEC")
+    swisseo_p.add_argument("--warp-memory-mib", type=int, default=256, metavar="MIB")
+    swisseo_p.add_argument("--max-output-gib", type=float, default=16.0, metavar="GIB")
+    swisseo_p.add_argument("--dry-run", action="store_true")
+    swisseo_p.add_argument("--overwrite", action="store_true")
+    swisseo_p.add_argument("--log-file", default=None, metavar="PATH")
+    swisseo_p.set_defaults(func=cmd_swisseo)
+
+    # --------------------------------------------------- Copernicus monthly
+    copernicus_monthly_p = sub.add_parser(
+        "copernicus-monthly",
+        help="Build direct SCL/CLD-screened monthly composites from local CDSE L2A assets",
+    )
+    copernicus_monthly_p.add_argument("--env-file", default=".env", metavar="PATH")
+    copernicus_monthly_p.add_argument("--year", type=int, required=True, metavar="YYYY")
+    copernicus_monthly_p.add_argument(
+        "--months",
+        nargs="+",
+        type=int,
+        default=[6, 7, 8],
+        metavar="MM",
+        help="Exactly which calendar months to process (default: 6 7 8)",
+    )
+    copernicus_roi = copernicus_monthly_p.add_mutually_exclusive_group()
+    copernicus_roi.add_argument(
+        "--bbox",
+        nargs=4,
+        type=float,
+        metavar=("WEST", "SOUTH", "EAST", "NORTH"),
+        help="WGS84 extent (default: Switzerland bounding box)",
+    )
+    copernicus_roi.add_argument(
+        "--roi",
+        metavar="GEOJSON",
+        help="Exact Swiss Polygon/MultiPolygon used as the national cutline",
+    )
+    copernicus_monthly_p.add_argument(
+        "--dataset-db",
+        default="satellite_data/copernicus-l2a/dataset.duckdb",
+        metavar="PATH",
+        help="DatasetCatalog containing the vegetation L2A asset profile",
+    )
+    copernicus_monthly_p.add_argument(
+        "--output-root",
+        default="satellite_data/copernicus-monthly",
+        metavar="DIR",
+    )
+    copernicus_monthly_p.add_argument("--target-crs", default="EPSG:2056", metavar="CRS")
+    copernicus_monthly_p.add_argument(
+        "--resolution",
+        type=float,
+        default=20.0,
+        metavar="METRES",
+        help="Common output grid (default: 20, matching the coarsest required bands)",
+    )
+    copernicus_monthly_p.add_argument(
+        "--max-cloud-cover",
+        type=float,
+        default=100.0,
+        metavar="PCT",
+        help="Optional scene-level ceiling; pixel masks still apply (default: 100)",
+    )
+    copernicus_monthly_p.add_argument(
+        "--cloud-probability-threshold",
+        type=float,
+        default=30.0,
+        metavar="PCT",
+        help="Maximum accepted CLD probability per pixel (default: 30)",
+    )
+    copernicus_monthly_p.add_argument("--compression", default="DEFLATE", metavar="CODEC")
+    copernicus_monthly_p.add_argument(
+        "--warp-memory-mib", type=int, default=256, metavar="MIB"
+    )
+    copernicus_monthly_p.add_argument(
+        "--max-output-gib", type=float, default=16.0, metavar="GIB"
+    )
+    copernicus_monthly_p.add_argument(
+        "--staging-root",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Persistent local volume used to copy each needed band before compute; "
+            "enables fast local reads and resume after interruption (default: read "
+            "straight from the dataset storage)"
+        ),
+    )
+    copernicus_monthly_p.add_argument("--dry-run", action="store_true")
+    copernicus_monthly_p.add_argument("--allow-incomplete-month", action="store_true")
+    copernicus_monthly_p.add_argument("--overwrite", action="store_true")
+    copernicus_monthly_p.add_argument("--log-file", default=None, metavar="PATH")
+    copernicus_monthly_p.set_defaults(func=cmd_copernicus_monthly)
+
+    # ------------------------------------------------------- swissEO monthly
+    swisseo_monthly_p = sub.add_parser(
+        "swisseo-monthly",
+        help="Merge every published swissEO orbit mosaic in each calendar month",
+    )
+    swisseo_monthly_p.add_argument("--env-file", default=".env", metavar="PATH")
+    swisseo_monthly_p.add_argument("--year", type=int, required=True, metavar="YYYY")
+    swisseo_monthly_p.add_argument(
+        "--months",
+        nargs="+",
+        type=int,
+        default=[6, 7, 8],
+        metavar="MM",
+        help="Calendar months to process (default: 6 7 8)",
+    )
+    swisseo_monthly_roi = swisseo_monthly_p.add_mutually_exclusive_group()
+    swisseo_monthly_roi.add_argument(
+        "--bbox",
+        nargs=4,
+        type=float,
+        metavar=("WEST", "SOUTH", "EAST", "NORTH"),
+        help="WGS84 extent (default: Switzerland bounding box)",
+    )
+    swisseo_monthly_roi.add_argument(
+        "--roi",
+        metavar="GEOJSON",
+        help="Exact Swiss Polygon/MultiPolygon used as the national cutline",
+    )
+    swisseo_monthly_p.add_argument(
+        "--stac-url",
+        default="https://data.geo.admin.ch/api/stac/v1",
+        metavar="URL",
+        help="Public swisstopo STAC API; no token is required",
+    )
+    swisseo_monthly_p.add_argument(
+        "--collection",
+        default="ch.swisstopo.swisseo_s2-sr_v100",
+        metavar="ID",
+    )
+    swisseo_monthly_p.add_argument(
+        "--output-root",
+        default="satellite_data/swisseo-monthly",
+        metavar="DIR",
+    )
+    swisseo_monthly_p.add_argument("--target-crs", default="EPSG:2056", metavar="CRS")
+    swisseo_monthly_p.add_argument(
+        "--resolution",
+        type=float,
+        default=20.0,
+        metavar="METRES",
+        help="Output grid (default: 20 because B05/B8A/B11 are native 20 m)",
+    )
+    swisseo_monthly_p.add_argument("--compression", default="DEFLATE", metavar="CODEC")
+    swisseo_monthly_p.add_argument(
+        "--warp-memory-mib", type=int, default=256, metavar="MIB"
+    )
+    swisseo_monthly_p.add_argument(
+        "--max-output-gib", type=float, default=16.0, metavar="GIB"
+    )
+    swisseo_monthly_p.add_argument(
+        "--max-temporary-gib",
+        type=float,
+        default=128.0,
+        metavar="GIB",
+        help="Safety ceiling for conservative monthly intermediate estimate (default: 128)",
+    )
+    swisseo_monthly_p.add_argument(
+        "--temporary-root",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Local staging directory for VRT/GeoTIFF work files (default: system temp); "
+            "completed TIFFs are copied sequentially to --output-root for SMB safety"
+        ),
+    )
+    swisseo_monthly_p.add_argument(
+        "--publication-wait-seconds",
+        type=float,
+        default=21_600.0,
+        metavar="SECONDS",
+        help=(
+            "How long completed local files wait and retry if --output-root is "
+            "disconnected (default: 21600, six hours; 0 fails immediately)"
+        ),
+    )
+    swisseo_monthly_p.add_argument("--dry-run", action="store_true")
+    swisseo_monthly_p.add_argument("--allow-incomplete-month", action="store_true")
+    swisseo_monthly_p.add_argument("--overwrite", action="store_true")
+    swisseo_monthly_p.add_argument("--log-file", default=None, metavar="PATH")
+    swisseo_monthly_p.set_defaults(func=cmd_swisseo_monthly)
+
+    # ---------------------------------------------------- monthly comparison
+    compare_monthly_p = sub.add_parser(
+        "compare-monthly",
+        help="Render a one-to-three-month vegetation comparison",
+    )
+    compare_monthly_p.add_argument("--env-file", default=".env", metavar="PATH")
+    compare_monthly_p.add_argument("--year", type=int, required=True, metavar="YYYY")
+    compare_monthly_p.add_argument(
+        "--months",
+        nargs="+",
+        type=int,
+        default=[6, 7, 8],
+        metavar="MM",
+        help="One to three calendar months (default: 6 7 8)",
+    )
+    compare_monthly_p.add_argument(
+        "--roi",
+        required=True,
+        metavar="GEOJSON",
+        help="Swiss Polygon/MultiPolygon; required for the valid-pixel denominator",
+    )
+    compare_monthly_p.add_argument(
+        "--copernicus-root",
+        default="satellite_data/copernicus-monthly",
+        metavar="DIR",
+    )
+    compare_monthly_p.add_argument(
+        "--force-root",
+        default="satellite_data/force-monthly",
+        metavar="DIR",
+    )
+    compare_monthly_p.add_argument(
+        "--swisseo-root",
+        default="satellite_data/swisseo-monthly",
+        metavar="DIR",
+    )
+    compare_monthly_p.add_argument(
+        "--sources",
+        nargs="+",
+        choices=("copernicus", "force", "swisseo"),
+        default=("copernicus", "force", "swisseo"),
+        metavar="SOURCE",
+        help="Sources to compare (default: copernicus force swisseo)",
+    )
+    compare_monthly_p.add_argument(
+        "--output-root",
+        default="artifacts/monthly-comparison",
+        metavar="DIR",
+    )
+    compare_monthly_p.add_argument("--target-crs", default="EPSG:2056", metavar="CRS")
+    compare_monthly_p.add_argument(
+        "--analysis-resolution",
+        type=float,
+        default=20.0,
+        metavar="METRES",
+        help="Shared statistics/map grid for all sources (default: 20)",
+    )
+    compare_monthly_p.add_argument(
+        "--preview-width", type=int, default=4096, metavar="PX"
+    )
+    compare_monthly_p.add_argument("--atlas-width", type=int, default=2400, metavar="PX")
+    compare_monthly_p.add_argument("--atlas-height", type=int, default=1800, metavar="PX")
+    compare_monthly_p.add_argument(
+        "--histogram-bins", type=int, default=64, metavar="N"
+    )
+    compare_monthly_p.add_argument("--overwrite", action="store_true")
+    compare_monthly_p.add_argument("--log-file", default=None, metavar="PATH")
+    compare_monthly_p.set_defaults(func=cmd_compare_monthly)
 
     # ---------------------------------------------------------------- query
     query_p = sub.add_parser(
@@ -1797,6 +2467,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--download-only",
         action="store_true",
         help="Download selected complete SAFE products without running FORCE",
+    )
+    force_pipeline_mode.add_argument(
+        "--process-only",
+        action="store_true",
+        help="Process complete SAFE products already recorded in the database",
     )
     force_pipeline_p.add_argument(
         "--runtime",

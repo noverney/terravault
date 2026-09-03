@@ -33,6 +33,7 @@ uses its own OAuth client ID/secret. See
 | **Explicit ROI** | Rolling discovery accepts a WGS84 bbox or Polygon/MultiPolygon GeoJSON |
 | **Historical backfill** | Windowed progress, durable cursor, quota waits and retired jobs |
 | **Compact NDVI profile** | Native 10 m B04/B08 plus SCL/CLD masks via `--asset-profile ndvi` |
+| **Three-source Swiss vegetation comparison** | Separate monthly composites from direct Copernicus L2A, post-FORCE BOA/QAI, and all published swissEO orbit mosaics, with four shared indices, coverage distributions and measured timings |
 | **CLI** | One-shot, rolling, historical, metadata-query and stitched-extraction commands |
 
 ---
@@ -238,6 +239,105 @@ python examples/switzerland_patch/fetch_switzerland_snapshot.py
 The architecture, data-volume tradeoffs, native S3 ingestion plan and
 operational runbook are in
 [`docs/SWITZERLAND_SENTINEL2_PIPELINE.md`](docs/SWITZERLAND_SENTINEL2_PIPELINE.md).
+
+### Three-source Swiss monthly vegetation comparison
+
+The pilot compares June, July and August for one year through three explicit,
+independent pixel routes:
+
+1. `copernicus-monthly` reads locally retrieved Copernicus Sentinel-2 L2A
+   bands plus SCL/CLD and creates a cloud-screened monthly median.
+2. `monthly` reads completed post-FORCE BOA/QAI products and creates a
+   QAI-screened monthly median.
+3. `swisseo-monthly` discovers every published swissEO S2-SR orbital-track
+   mosaic in the month through swisstopo's public STAC API, masks each item,
+   and merges all items into a monthly median. The swissEO STAC API does not
+   require a token.
+
+Plan or run the same months separately for each route:
+
+```bash
+terravault copernicus-monthly \
+  --year 2024 --months 6 7 8 \
+  --dataset-db satellite_data/dataset.duckdb \
+  --output-root satellite_data/copernicus-monthly \
+  --dry-run
+
+terravault monthly \
+  --year 2024 --months 6 7 8 \
+  --force-db satellite_data/force-native/force_images.duckdb \
+  --output-root satellite_data/force-monthly \
+  --dry-run
+
+terravault swisseo-monthly \
+  --year 2024 --months 6 7 8 \
+  --output-root satellite_data/swisseo-monthly \
+  --temporary-root /private/tmp/terravault-swisseo \
+  --publication-wait-seconds 21600 \
+  --dry-run
+```
+
+For an SMB output, swissEO GeoTIFF work stays on `--temporary-root`. Completed
+files are copied sequentially, and the local stage is retained while a missing
+output mount is retried for up to six hours by default. Change that window with
+`--publication-wait-seconds`.
+
+The three monthly commands write the high-resolution reflectance and index
+COGs. After every requested source/month product exists, `compare-monthly`
+reads those scientific products and creates preview maps plus a lower-resolution
+comparison atlas. It accepts one to three months; the default three-month run
+builds the 9-by-12 logical atlas:
+
+```bash
+terravault compare-monthly \
+  --year 2024 --months 6 7 8 \
+  --roi /path/to/switzerland.geojson \
+  --copernicus-root satellite_data/copernicus-monthly \
+  --force-root satellite_data/force-monthly \
+  --swisseo-root satellite_data/swisseo-monthly \
+  --output-root artifacts/monthly-comparison
+```
+
+Each monthly route calculates NDVI, GNDVI, NDRE and NDWI using the same band
+equations. TreeAI is the equation reference only: no TreeAI pixels or
+processing products enter any route. The atlas uses nine rows (three months ×
+three sources) and four index columns; each cell combines an index map, value
+distribution and valid-pixel coverage. Row annotations show measured monthly
+mosaic time, combined four-index calculation time and total wall-clock time.
+
+The comparison output is also a report folder. It contains separate
+`sources/sentinel-copernicus`, `sources/force` and `sources/swisseo` trees,
+each with a three-month overview and individual false-colour/NDVI/GNDVI/NDRE/
+NDWI PNGs. Every index PNG sits beside a losslessly compressed, single-band
+COG (`ndvi.tif`, `gndvi.tif`, `ndre.tif` or `ndwi.tif`) extracted from the
+source four-band index COG at its native stored grid. These TIFFs are not
+resampled to the 20 m comparison grid. A report manifest records both paths,
+the source band, native pixel size and originating multi-band COG. The six-band
+reflectance COG is referenced rather than duplicated. TIFF encoding is staged
+in the local system temporary directory and then copied sequentially into the
+report, avoiding random-seek GeoTIFF writes on an SMB destination. Preview
+rasters use the supplied Swiss cutline, leaving pixels outside Switzerland
+transparent rather than showing the bounding rectangle.
+For the ETH pilot, the mounted path
+`/Volumes/upscale/working_package_4/terravault` is used for all bulky inputs,
+scientific outputs and reports; random-seek raster staging remains local.
+
+Valid-pixel coverage is calculated from the final common comparison grid. It
+is not the same quantity as Copernicus/FORCE STAC scene-level cloud-cover
+metadata, nor swissEO's source `percent_masked`; those source metrics retain
+their own labels and definitions. Timings also have different input scopes:
+the direct and FORCE routes start from local inputs, while the swissEO monthly
+stage includes remote COG access and alignment. Do not rank the routes by raw
+seconds without accounting for those boundaries.
+
+This repository does not claim that the full national three-source products
+have already been generated. A dry run records inventory/planning information
+and zero production-stage timings; it is not a measured benchmark. A swissEO
+monthly dry run also records a conservative peak-temporary-storage estimate.
+Production refuses to start when that estimate exceeds either the configured
+temporary-storage limit or currently free disk space. See the complete source,
+output and comparison contracts in
+[`docs/SWITZERLAND_MONTHLY_COMPOSITES.md`](docs/SWITZERLAND_MONTHLY_COMPOSITES.md).
 
 ### Restartable rolling ingestion
 
@@ -557,6 +657,11 @@ Commands:
   run          Execute one pipeline ingestion run
   watch        Run restartable rolling ingestion for an explicit region
   historic     Gradually backfill complete native data from a start date
+  copernicus-monthly  Build a direct L2A monthly Swiss vegetation composite
+  monthly      Build a post-FORCE monthly Swiss vegetation composite
+  swisseo-monthly  Build a monthly composite from all swissEO orbit mosaics
+  compare-monthly  Compare three sources, four indices, coverage and timings
+  swisseo-image  Build indices from one published swissEO orbit mosaic
   query        Query local georeferenced raster pieces from dataset DuckDB
   extract      Stream intersecting pieces into one multiband COG
   force        Import a stitched raster into a FORCE feature datacube

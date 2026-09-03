@@ -69,6 +69,20 @@ NDVI_L2A_ASSET_KEYS: tuple[str, ...] = (
     "CLD_20m",
 )
 
+# Direct Copernicus input contract for NDVI, GNDVI, NDRE and NIR/SWIR NDWI.
+# Native asset resolutions are preserved in storage; derived monthly products
+# align the six reflectance bands on their configured output grid.
+VEGETATION_L2A_ASSET_KEYS: tuple[str, ...] = (
+    "B03_10m",
+    "B04_10m",
+    "B05_20m",
+    "B08_10m",
+    "B8A_20m",
+    "B11_20m",
+    "SCL_20m",
+    "CLD_20m",
+)
+
 _SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
 _MIN_BOOTSTRAP_FOOTPRINT_RATIO = 0.9
 
@@ -128,9 +142,15 @@ class RollingConfig:
             or self.quota_retry_seconds < 0
         ):
             raise ValueError("retry delays cannot be negative")
-        if self.asset_profile not in {"native", "ndvi", "metadata-only", "custom"}:
+        if self.asset_profile not in {
+            "native",
+            "ndvi",
+            "vegetation",
+            "metadata-only",
+            "custom",
+        }:
             raise ValueError(
-                "asset_profile must be native, ndvi, metadata-only or custom"
+                "asset_profile must be native, ndvi, vegetation, metadata-only or custom"
             )
         if self.asset_profile == "custom" and not self.asset_keys:
             raise ValueError("custom asset profile requires at least one --asset-key")
@@ -145,6 +165,8 @@ class RollingConfig:
             return tuple(dict.fromkeys(self.asset_keys))
         if self.asset_profile == "ndvi":
             return NDVI_L2A_ASSET_KEYS
+        if self.asset_profile == "vegetation":
+            return VEGETATION_L2A_ASSET_KEYS
         return NATIVE_L2A_ASSET_KEYS
 
     @property
