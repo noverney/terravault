@@ -525,3 +525,68 @@ def test_renderer_creates_complete_small_atlas_on_common_roi_grid(tmp_path: Path
         for row in statistics["rows"]
         for index in row["indices"]
     )
+
+
+def _write_product_tree_at_resolution(
+    root: Path, *, source: str, year: int, month: int, resolution: str
+) -> None:
+    directory = root / f"year={year:04d}" / f"month={month:02d}"
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = f"{source}_{year:04d}_{month:02d}_{resolution}"
+    (directory / f"{stem}_reflectance.tif").write_bytes(b"reflectance")
+    (directory / f"{stem}_indices.tif").write_bytes(b"indices")
+    (directory / f"{stem}.manifest.json").write_text(
+        json.dumps({"source": source, "resolution": resolution}), encoding="utf-8"
+    )
+
+
+def test_discovery_selects_products_by_resolution(tmp_path: Path):
+    roots = {source: tmp_path / source for source in COMPARISON_SOURCES}
+    for source, root in roots.items():
+        for resolution in ("10m", "20m"):
+            _write_product_tree_at_resolution(
+                root, source=source, year=2024, month=7, resolution=resolution
+            )
+
+    for resolution, token in ((10.0, "10m"), (20.0, "20m")):
+        products = discover_comparison_products(
+            year=2024,
+            months=(7,),
+            copernicus_root=roots["copernicus"],
+            force_root=roots["force"],
+            swisseo_root=roots["swisseo"],
+            product_resolution=resolution,
+        )
+        assert len(products) == len(COMPARISON_SOURCES)
+        for product in products:
+            assert f"_{token}_" in product.reflectance_path.name
+            assert f"_{token}_" in product.indices_path.name
+            assert product.manifest_path.name.endswith(f"_{token}.manifest.json")
+
+
+def test_discovery_without_resolution_is_ambiguous_when_two_coexist(tmp_path: Path):
+    roots = {source: tmp_path / source for source in COMPARISON_SOURCES}
+    for source, root in roots.items():
+        for resolution in ("10m", "20m"):
+            _write_product_tree_at_resolution(
+                root, source=source, year=2024, month=7, resolution=resolution
+            )
+
+    with pytest.raises(FileNotFoundError, match="product_resolution"):
+        discover_comparison_products(
+            year=2024,
+            months=(7,),
+            copernicus_root=roots["copernicus"],
+            force_root=roots["force"],
+            swisseo_root=roots["swisseo"],
+        )
+
+
+def test_resolution_token_matches_the_monthly_output_stems():
+    from terravault.comparison import resolution_token
+
+    assert resolution_token(20.0) == "20m"
+    assert resolution_token(10) == "10m"
+    assert resolution_token(0.5) == "0p5m"
+    with pytest.raises(ValueError):
+        resolution_token(0)

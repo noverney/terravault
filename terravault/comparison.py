@@ -66,13 +66,26 @@ class ComparisonProduct:
             object.__setattr__(self, name, Path(getattr(self, name)).expanduser().resolve())
 
 
+def resolution_token(resolution: float) -> str:
+    """Filename token for an output resolution, matching the monthly stems."""
+
+    if resolution <= 0:
+        raise ValueError("resolution must be positive")
+    return f"{resolution:g}m".replace(".", "p")
+
+
 def _unique_file(directory: Path, pattern: str) -> Path:
     matches = tuple(sorted(directory.glob(pattern)))
-    if len(matches) != 1:
-        raise FileNotFoundError(
-            f"Expected exactly one {pattern!r} in {directory}; found {len(matches)}"
-        )
-    return matches[0]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(f"Expected one {pattern!r} in {directory}; found none")
+    names = ", ".join(path.name for path in matches)
+    raise FileNotFoundError(
+        f"Expected exactly one {pattern!r} in {directory}; found {len(matches)}: "
+        f"{names}. Products of more than one resolution share this directory; "
+        "select one with product_resolution (--product-resolution)."
+    )
 
 
 def discover_comparison_products(
@@ -83,8 +96,14 @@ def discover_comparison_products(
     force_root: str | Path,
     swisseo_root: str | Path,
     sources: Sequence[str] = COMPARISON_SOURCES,
+    product_resolution: float | None = None,
 ) -> tuple[ComparisonProduct, ...]:
-    """Resolve the selected source/month products from deterministic output trees."""
+    """Resolve the selected source/month products from deterministic output trees.
+
+    A month directory holds one set of products per output resolution, because
+    the resolution is part of every filename. Pass ``product_resolution`` to
+    select one set when several coexist; leave it unset when only one does.
+    """
 
     requested = tuple(str(source) for source in sources)
     if not requested:
@@ -95,6 +114,7 @@ def discover_comparison_products(
     if unknown:
         raise ValueError("Unknown comparison sources: " + ", ".join(unknown))
     selected = tuple(source for source in COMPARISON_SOURCES if source in requested)
+    suffix = "" if product_resolution is None else f"_{resolution_token(product_resolution)}"
 
     roots = {
         "copernicus": Path(copernicus_root).expanduser().resolve(),
@@ -110,9 +130,11 @@ def discover_comparison_products(
                     source=source,
                     year=year,
                     month=int(month),
-                    reflectance_path=_unique_file(directory, "*_reflectance.tif"),
-                    indices_path=_unique_file(directory, "*_indices.tif"),
-                    manifest_path=_unique_file(directory, "*.manifest.json"),
+                    reflectance_path=_unique_file(
+                        directory, f"*{suffix}_reflectance.tif"
+                    ),
+                    indices_path=_unique_file(directory, f"*{suffix}_indices.tif"),
+                    manifest_path=_unique_file(directory, f"*{suffix}.manifest.json"),
                 )
             )
     return tuple(products)

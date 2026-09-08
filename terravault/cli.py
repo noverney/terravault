@@ -626,6 +626,7 @@ def cmd_compare_monthly(args: argparse.Namespace) -> int:
             force_root=args.force_root,
             swisseo_root=args.swisseo_root,
             sources=args.sources,
+            product_resolution=args.product_resolution,
         )
         result = MonthlyComparisonRenderer(
             ComparisonConfig(
@@ -2024,6 +2025,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
     )
     compare_monthly_p.add_argument("--target-crs", default="EPSG:2056", metavar="CRS")
+    compare_monthly_p.add_argument(
+        "--product-resolution",
+        type=float,
+        default=None,
+        metavar="METRES",
+        help=(
+            "Select the input products by their output resolution, e.g. 10 or 20. "
+            "Required once a month directory holds more than one resolution"
+        ),
+    )
     compare_monthly_p.add_argument(
         "--analysis-resolution",
         type=float,
