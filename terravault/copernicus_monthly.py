@@ -9,16 +9,18 @@ four source-neutral vegetation equations.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import shutil
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .catalog import SWITZERLAND_BBOX
 from .dataset_catalog import DatasetCatalog
@@ -50,6 +52,28 @@ COPERNICUS_REFLECTANCE_ASSETS: tuple[str, ...] = (
 COPERNICUS_QUALITY_ASSETS: tuple[str, ...] = ("SCL_20m", "CLD_20m")
 DEFAULT_INVALID_SCL_CLASSES: tuple[int, ...] = (0, 1, 3, 8, 9, 10, 11)
 COPERNICUS_MINIMUM_PHYSICAL_REFLECTANCE = 0.0
+logger = logging.getLogger(__name__)
+
+# Staging reads from a high-latency archive share, where a single stream is
+# dominated by round trips: measured 0.64 MB/s serial against 1.85 MB/s over
+# four concurrent copies. Fetch several assets at once.
+_PREFETCH_WORKERS = max(1, int(os.environ.get("TERRAVAULT_PREFETCH_WORKERS", "8")))
+
+# Scene reflectances are independent GDAL subprocess jobs and dominate the
+# route's runtime, so run several at once. Tiles overlap too, which keeps the
+# pool fed while a finished tile writes its median. Both are bounded: each
+# tile in flight holds its scenes' intermediates until its median is written.
+_SCENE_WORKERS = max(1, int(os.environ.get("TERRAVAULT_SCENE_WORKERS", "6")))
+_TILE_WORKERS = max(1, int(os.environ.get("TERRAVAULT_TILE_WORKERS", "3")))
+# Medians run in their own pool so a tile that finishes its scenes hands the
+# median off and immediately starts the next tile's scenes. Without this the
+# scene pool drains every time a batch of tiles finishes together.
+_MEDIAN_WORKERS = max(1, int(os.environ.get("TERRAVAULT_MEDIAN_WORKERS", "3")))
+
+# Sentinel for "the CDSE origin has not been resolved yet", distinct from the
+# None that means "unavailable, use the archive".
+_UNRESOLVED = object()
+
 _VARIABLES = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 _FLOAT32_BYTES = 4
 
@@ -95,6 +119,7 @@ def select_copernicus_scenes(
     pieces: Sequence[dict[str, Any]],
     *,
     max_cloud_cover: float | None,
+    is_available: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> tuple[dict[str, list[CopernicusMonthlyScene]], dict[str, tuple[str, ...]]]:
     """Select complete L2A items and group them without mixing acquisition bands."""
 
@@ -102,6 +127,9 @@ def select_copernicus_scenes(
     for piece in pieces:
         grouped.setdefault(str(piece["item_id"]), {})[str(piece["asset_key"])] = piece
     required = set(VEGETATION_L2A_ASSET_KEYS)
+    # By default an asset counts as present only where the catalogue recorded
+    # it; callers that stage inputs elsewhere supply their own check.
+    available = is_available or (lambda piece: Path(str(piece["local_path"])).is_file())
     selected: dict[str, list[CopernicusMonthlyScene]] = {}
     skipped: dict[str, tuple[str, ...]] = {}
     for item_id, assets in grouped.items():
@@ -111,7 +139,7 @@ def select_copernicus_scenes(
         reasons.extend(
             f"missing-file:{key}"
             for key in sorted(required.intersection(assets))
-            if not Path(str(assets[key]["local_path"])).is_file()
+            if not available(assets[key])
         )
         exemplar = next(iter(assets.values()))
         cloud_raw = exemplar.get("cloud_cover")
@@ -219,6 +247,7 @@ class CopernicusMonthlyProcessor:
                 f"Copernicus dataset catalogue does not exist: {config.dataset_db}"
             )
         self.catalog = DatasetCatalog(config.dataset_db)
+        self._origin: Any | None | type = _UNRESOLVED
         self._gdal = (
             {}
             if config.dry_run
@@ -235,7 +264,11 @@ class CopernicusMonthlyProcessor:
             end_datetime=end - timedelta(microseconds=1),
             asset_keys=VEGETATION_L2A_ASSET_KEYS,
         )
-        return select_copernicus_scenes(pieces, max_cloud_cover=self.config.max_cloud_cover)
+        return select_copernicus_scenes(
+            pieces,
+            max_cloud_cover=self.config.max_cloud_cover,
+            is_available=self._asset_available,
+        )
 
     def _warp_asset(
         self,
@@ -295,6 +328,60 @@ class CopernicusMonthlyProcessor:
             )
         return physical_scale, physical_offset
 
+    def _asset_available(self, piece: Mapping[str, Any]) -> bool:
+        """Whether this asset can be read this run, wherever it now lives.
+
+        The archive share is only one of three possible sources, and the
+        slowest.  Selection must not fail merely because it is unmounted when
+        the bands are already staged locally or fetchable from the origin.
+        """
+
+        if self.config.staging_root is not None:
+            staged = (
+                self.config.staging_root
+                / "bands"
+                / str(piece["item_id"])
+                / Path(str(piece["local_path"])).name
+            )
+            expected = piece.get("byte_count") or None
+            if staged.is_file() and (expected is None or staged.stat().st_size == expected):
+                return True
+        if str(piece.get("href") or "").startswith("s3://"):
+            if self._origin_downloader() is not None:
+                return True
+        try:
+            return Path(str(piece["local_path"])).is_file()
+        except OSError:
+            return False
+
+    def _origin_downloader(self) -> Any | None:
+        """An S3 downloader for the CDSE origin, or None to use the archive.
+
+        The archived copies on the network share read two orders of magnitude
+        slower than the CDSE objects they were made from, so prefer the origin
+        whenever it is configured and reachable.
+        """
+
+        if self._origin is not _UNRESOLVED:
+            return self._origin
+        from .s3_downloader import S3Config, S3Downloader
+
+        config = S3Config(
+            access_key=os.environ.get("TERRAVAULT_CDSE_S3_ACCESS_KEY", ""),
+            secret_key=os.environ.get("TERRAVAULT_CDSE_S3_SECRET_KEY", ""),
+            endpoint_url=os.environ.get(
+                "TERRAVAULT_CDSE_S3_ENDPOINT", "https://eodata.dataspace.copernicus.eu"
+            ),
+            region_name=os.environ.get("TERRAVAULT_CDSE_S3_REGION", "default"),
+        )
+        try:
+            config.validate()
+            self._origin = S3Downloader(config)
+        except Exception:  # noqa: BLE001 - any misconfiguration falls back
+            logger.info("CDSE origin not configured; staging from the archive share")
+            self._origin = None
+        return self._origin
+
     def _stage_local(self, piece: Mapping[str, Any], staging_dir: Path) -> dict[str, Any]:
         """Copy one band to the persistent local staging root and resume safely.
 
@@ -308,18 +395,107 @@ class CopernicusMonthlyProcessor:
         if self.config.staging_root is None:
             return dict(piece)
         destination = staging_dir / source.name
-        expected = source.stat().st_size
-        if not (destination.exists() and destination.stat().st_size == expected):
+        # Prefer the catalogue's recorded size so a healthy origin download does
+        # not have to stat the archive share at all.
+        expected = piece.get("byte_count") or None
+        href = str(piece.get("href") or "")
+        if not (destination.exists() and expected and destination.stat().st_size == expected):
             staging_dir.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.partial")
-            shutil.copyfile(source, temporary)
-            if temporary.stat().st_size != expected:
-                temporary.unlink(missing_ok=True)
-                raise IOError(f"Incomplete staged copy of {source.name}")
-            os.replace(temporary, destination)
+            downloader = self._origin_downloader() if href.startswith("s3://") else None
+            staged_from_origin = False
+            if downloader is not None:
+                try:
+                    downloader.download(href, destination)
+                    staged_from_origin = True
+                except Exception as exc:  # noqa: BLE001 - the archive is the fallback
+                    logger.warning(
+                        "CDSE origin download failed for %s (%s); using the archive",
+                        destination.name, exc,
+                    )
+                    self._origin = None
+            if not staged_from_origin:
+                if expected is None:
+                    expected = source.stat().st_size
+                temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.partial")
+                shutil.copyfile(source, temporary)
+                if temporary.stat().st_size != expected:
+                    temporary.unlink(missing_ok=True)
+                    raise IOError(f"Incomplete staged copy of {source.name}")
+                os.replace(temporary, destination)
         staged = dict(piece)
         staged["local_path"] = destination
         return staged
+
+    def _prefetch_inputs(
+        self, scenes_by_tile: Mapping[str, Sequence["CopernicusMonthlyScene"]]
+    ) -> None:
+        """Stage every band this month needs onto the local volume up front.
+
+        Staging was already per-scene and resumable, but it ran interleaved
+        with the tile loop, which kept the input share on the critical path
+        for the whole run.  Copying everything first bounds that exposure to
+        the prefetch itself: a share that drops afterwards costs nothing.
+        """
+
+        if self.config.staging_root is None:
+            return
+        scenes = [scene for group in scenes_by_tile.values() for scene in group]
+        work = [
+            (scene.assets[key], self.config.staging_root / "bands" / scene.item_id)
+            for scene in scenes
+            for key in VEGETATION_L2A_ASSET_KEYS
+        ]
+        total = len(work)
+        started = time.perf_counter()
+        staged = 0
+        copied = 0
+
+        def stage_one(job: tuple[Mapping[str, Any], Path]) -> int:
+            piece, destination = job
+            local = destination / Path(str(piece["local_path"])).name
+            fresh = not local.exists()
+            self._stage_local(piece, destination)
+            return local.stat().st_size if fresh else 0
+
+        with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
+            for size in pool.map(stage_one, work):
+                copied += size
+                staged += 1
+                if staged % 20 == 0 or staged == total:
+                    elapsed = time.perf_counter() - started
+                    rate = (copied / 1024**2 / elapsed) if elapsed > 0 else 0.0
+                    logger.info(
+                        "prefetched %d/%d bands (%.1f GiB, %.2f MB/s)",
+                        staged, total, copied / 1024**3, rate,
+                    )
+        logger.info(
+            "input prefetch complete: %d bands, %.1f GiB copied in %.1fs; "
+            "the input share is no longer needed for this run",
+            total,
+            copied / 1024**3,
+            time.perf_counter() - started,
+        )
+
+    def _readable_raster(
+        self, path: Path, *, bands: int, size: tuple[int, int] | None = None
+    ) -> bool:
+        """Whether an artefact left by an earlier run is complete enough to reuse."""
+
+        if self.config.overwrite or not path.exists():
+            return False
+        try:
+            info = inspect_raster(self._gdal["gdalinfo"], path)
+        except RuntimeError:
+            # An unreadable leftover is worth nothing; drop it and recompute.
+            path.unlink(missing_ok=True)
+            return False
+        if len(info.get("bands", [])) != bands:
+            path.unlink(missing_ok=True)
+            return False
+        if size is not None and tuple(int(value) for value in info["size"]) != size:
+            path.unlink(missing_ok=True)
+            return False
+        return True
 
     def _scene_reflectance(self, scene: CopernicusMonthlyScene, directory: Path) -> Path:
         directory.mkdir(parents=True)
@@ -540,24 +716,95 @@ class CopernicusMonthlyProcessor:
         if self.config.overwrite:
             partial_reflectance.unlink(missing_ok=True)
             partial_indices.unlink(missing_ok=True)
+        # Tile medians cost tens of minutes each and used to live inside the
+        # TemporaryDirectory below, so any failure -- most often the input
+        # share dropping mid-run -- discarded every finished tile.  Keep them
+        # beside the partial products instead, so a rerun resumes from the
+        # last tile that completed.
+        tile_checkpoint = (
+            work_root / "tiles" if self.config.staging_root is not None else None
+        )
+        if tile_checkpoint is not None and self.config.overwrite:
+            shutil.rmtree(tile_checkpoint, ignore_errors=True)
         try:
             with tempfile.TemporaryDirectory(
                 prefix="terravault-copernicus-monthly-", dir=work_root
             ) as temporary:
                 temp = Path(temporary)
                 mosaic_started = time.perf_counter()
-                tiles: list[Path] = []
-                for tile, scenes in scenes_by_tile.items():
-                    scene_root = temp / "scenes" / tile
-                    inputs = [self._scene_reflectance(scene, scene_root / scene.item_id) for scene in scenes]
-                    tile_output = temp / "tiles" / f"{tile}.tif"
-                    tile_output.parent.mkdir(parents=True, exist_ok=True)
+                self._prefetch_inputs(scenes_by_tile)
+                checkpoint = tile_checkpoint if tile_checkpoint is not None else temp / "tiles"
+                checkpoint.mkdir(parents=True, exist_ok=True)
+                ordered = list(scenes_by_tile.items())
+
+                def write_median(
+                    tile_output: Path,
+                    inputs: Sequence[Path],
+                    scene_root: Path,
+                    scene_count: int,
+                    index: int,
+                ) -> Path:
+                    # Give the tile its final name only once it is complete, so
+                    # an interrupted write is never mistaken for a finished tile.
+                    pending = tile_output.with_name(f".{tile_output.name}.partial")
+                    pending.unlink(missing_ok=True)
                     write_multiband_median(
-                        input_paths=inputs, output_path=tile_output, band_names=REFLECTANCE_BAND_NAMES,
+                        input_paths=inputs, output_path=pending, band_names=REFLECTANCE_BAND_NAMES,
                         gdal=self._gdal, nodata=self.config.nodata, compression=self.config.compression,
                     )
-                    tiles.append(tile_output)
+                    os.replace(pending, tile_output)
+                    logger.info(
+                        "completed tile median %s (%d scenes, %d/%d tiles)",
+                        tile_output.name, scene_count, index + 1, len(ordered),
+                    )
+                    # Free this tile's scene intermediates only once the median
+                    # exists: they are what bounds peak scratch in flight.
                     shutil.rmtree(scene_root, ignore_errors=True)
+                    return tile_output
+
+                def build_tile(numbered: tuple[int, tuple[str, Sequence[CopernicusMonthlyScene]]]):
+                    index, (tile, scenes) = numbered
+                    tile_output = checkpoint / f"{tile}.tif"
+                    if self._readable_raster(tile_output, bands=len(REFLECTANCE_BAND_NAMES)):
+                        logger.info("reusing tile median %s from an earlier run", tile_output.name)
+                        return index, None
+                    scene_root = temp / "scenes" / tile
+                    # Scenes are independent, but the median's inputs must stay
+                    # in acquisition order for the result to be reproducible.
+                    inputs = list(
+                        scene_pool.map(
+                            lambda scene: self._scene_reflectance(
+                                scene, scene_root / scene.item_id
+                            ),
+                            scenes,
+                        )
+                    )
+                    # Hand the median to its own pool so this worker can start
+                    # the next tile's scenes instead of blocking on the write.
+                    return index, median_pool.submit(
+                        write_median, tile_output, inputs, scene_root, len(scenes), index
+                    )
+
+                # Separate pools: tile workers only ever block on scene futures,
+                # so they cannot starve the scene pool of its own threads.
+                built: dict[int, Path] = {}
+                pending_medians: dict[int, Any] = {}
+                with ThreadPoolExecutor(max_workers=_SCENE_WORKERS) as scene_pool, \
+                        ThreadPoolExecutor(max_workers=_MEDIAN_WORKERS) as median_pool, \
+                        ThreadPoolExecutor(max_workers=_TILE_WORKERS) as tile_pool:
+                    logger.info(
+                        "building %d tiles with %d tile, %d scene and %d median workers",
+                        len(ordered), _TILE_WORKERS, _SCENE_WORKERS, _MEDIAN_WORKERS,
+                    )
+                    for index, future in tile_pool.map(build_tile, list(enumerate(ordered))):
+                        if future is None:
+                            built[index] = checkpoint / f"{ordered[index][0]}.tif"
+                        else:
+                            pending_medians[index] = future
+                    # Every median must land before the mosaic reads the tiles.
+                    for index, future in pending_medians.items():
+                        built[index] = future.result()
+                tiles: list[Path] = [built[index] for index in range(len(ordered))]
                 country = self._country_vrt(tiles, temp)
                 info = inspect_raster(self._gdal["gdalinfo"], country)
                 width, height = (int(value) for value in info["size"])
@@ -569,19 +816,32 @@ class CopernicusMonthlyProcessor:
                 )
                 if exact_estimated / (1024**3) > self.config.max_output_gib:
                     raise ValueError("Exact uncompressed output exceeds max_output_gib")
-                write_described_cog(
-                    source_path=country, output_path=partial_reflectance,
-                    band_names=REFLECTANCE_BAND_NAMES, gdal=self._gdal,
-                    compression=self.config.compression,
-                    metadata={"TERRAVAULT_SOURCE": "copernicus-sentinel-2-l2a"},
-                )
+                if self._readable_raster(
+                    partial_reflectance, bands=len(REFLECTANCE_BAND_NAMES), size=(width, height)
+                ):
+                    logger.info(
+                        "reusing reflectance %s from an earlier run", partial_reflectance.name
+                    )
+                else:
+                    pending = partial_reflectance.with_name(f".{partial_reflectance.name}.partial")
+                    pending.unlink(missing_ok=True)
+                    write_described_cog(
+                        source_path=country, output_path=pending,
+                        band_names=REFLECTANCE_BAND_NAMES, gdal=self._gdal,
+                        compression=self.config.compression,
+                        metadata={"TERRAVAULT_SOURCE": "copernicus-sentinel-2-l2a"},
+                    )
+                    os.replace(pending, partial_reflectance)
                 timings["monthly_mosaic_generation"] = time.perf_counter() - mosaic_started
                 stage = time.perf_counter()
+                pending = partial_indices.with_name(f".{partial_indices.name}.partial")
+                pending.unlink(missing_ok=True)
                 write_vegetation_indices(
-                    reflectance_path=partial_reflectance, output_path=partial_indices,
+                    reflectance_path=partial_reflectance, output_path=pending,
                     gdal=self._gdal, nodata=self.config.nodata, compression=self.config.compression,
                     metadata={"TERRAVAULT_SOURCE": "copernicus-sentinel-2-l2a"},
                 )
+                os.replace(pending, partial_indices)
                 timings["index_calculation"] = time.perf_counter() - stage
             if self.config.staging_root is None:
                 os.replace(partial_reflectance, reflectance)
@@ -589,6 +849,10 @@ class CopernicusMonthlyProcessor:
             else:
                 shutil.copyfile(partial_reflectance, reflectance)
                 shutil.copyfile(partial_indices, indices)
+            # The finished products no longer depend on the tile medians, so
+            # a completed month must not keep ~100 GiB of scratch alive.
+            if tile_checkpoint is not None:
+                shutil.rmtree(tile_checkpoint, ignore_errors=True)
         finally:
             if self.config.staging_root is None:
                 partial_reflectance.unlink(missing_ok=True)

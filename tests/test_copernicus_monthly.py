@@ -286,3 +286,230 @@ def test_copernicus_monthly_runs_end_to_end_on_small_aligned_scenes(
     second = CopernicusMonthlyProcessor(config).run()
     assert second.reflectance_path.is_file()
     assert second.indices_path.is_file()
+
+
+def _real_scene_pieces(
+    tmp_path: Path, *, item_id: str, tile_id: str, day: int
+) -> list[dict[str, Any]]:
+    """Create one acquisition of real single-band rasters for every asset."""
+
+    band_values = {
+        "B03_10m": 4000,
+        "B04_10m": 3000,
+        "B05_20m": 3500,
+        "B08_10m": 7000,
+        "B8A_20m": 6800,
+        "B11_20m": 4500,
+        "SCL_20m": 4,
+        "CLD_20m": 10,
+    }
+    pieces: list[dict[str, Any]] = []
+    for key in VEGETATION_L2A_ASSET_KEYS:
+        path = tmp_path / "assets" / item_id / f"{key}.tif"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "gdal_create", "-of", "GTiff", "-ot", "UInt16", "-outsize", "100", "50",
+                "-bands", "1", "-burn", str(band_values[key]), "-a_srs", "EPSG:4326",
+                "-a_ullr", "7.0", "47.0", "8.0", "46.5", "-a_nodata", "0", str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        is_reflectance = key not in {"SCL_20m", "CLD_20m"}
+        pieces.append(
+            {
+                "item_id": item_id,
+                "asset_key": key,
+                "local_path": str(path),
+                "acquisition_time": datetime(2024, 6, day, 10, tzinfo=timezone.utc),
+                "tile_id": tile_id,
+                "cloud_cover": 10.0,
+                "nodata": 0,
+                "raster_scale": 0.0001 if is_reflectance else None,
+                "raster_offset": -0.1 if is_reflectance else None,
+            }
+        )
+    return pieces
+
+
+def test_interrupted_run_keeps_finished_tiles_and_resumes_from_them(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """A drop mid-run must cost only the tile that was in flight.
+
+    Tile medians are the expensive artefact of this route, so losing every
+    finished one to a transient input-share failure made long months
+    unrunnable.
+    """
+
+    database_path = tmp_path / "dataset.duckdb"
+    database_path.write_bytes(b"catalog-placeholder")
+    pieces = _real_scene_pieces(tmp_path, item_id="scene-a", tile_id="32TMT", day=6)
+    pieces += _real_scene_pieces(tmp_path, item_id="scene-b", tile_id="32TNT", day=7)
+
+    class FakeDatasetCatalog:
+        def __init__(self, path: Path) -> None:
+            assert path == database_path
+
+        def query_raster_pieces(self, **_kwargs: Any) -> list[dict[str, Any]]:
+            return pieces
+
+    monkeypatch.setattr(
+        "terravault.copernicus_monthly.DatasetCatalog", FakeDatasetCatalog
+    )
+    config = CopernicusMonthlyConfig(
+        dataset_db=database_path,
+        output_root=tmp_path / "monthly",
+        year=2024,
+        month=6,
+        bbox=(7.0, 46.5, 8.0, 47.0),
+        resolution=500.0,
+        max_output_gib=1.0,
+        staging_root=tmp_path / "staging",
+    )
+
+    import terravault.copernicus_monthly as module
+
+    # Pin to one worker so "the tile that failed" is deterministic; parallel
+    # ordering is covered separately.
+    monkeypatch.setattr(module, "_SCENE_WORKERS", 1)
+    monkeypatch.setattr(module, "_TILE_WORKERS", 1)
+    monkeypatch.setattr(module, "_MEDIAN_WORKERS", 1)
+    genuine_median = module.write_multiband_median
+    first_pass: list[str] = []
+
+    def median_failing_on_the_second_tile(**kwargs: Any) -> Any:
+        if first_pass:
+            raise RuntimeError("input share dropped")
+        first_pass.append(Path(kwargs["output_path"]).name)
+        return genuine_median(**kwargs)
+
+    monkeypatch.setattr(module, "write_multiband_median", median_failing_on_the_second_tile)
+    with pytest.raises(RuntimeError, match="input share dropped"):
+        CopernicusMonthlyProcessor(config).run()
+
+    checkpoint = config.staging_root / "work" / config.stem / "tiles"
+    finished = sorted(path.name for path in checkpoint.glob("*.tif"))
+    assert finished == ["32TMT.tif"], f"expected the first tile to survive, got {finished}"
+    assert not list(checkpoint.glob(".*.partial")), "an interrupted write must not survive"
+
+    recomputed: list[str] = []
+
+    def counting_median(**kwargs: Any) -> Any:
+        recomputed.append(Path(kwargs["output_path"]).name)
+        return genuine_median(**kwargs)
+
+    monkeypatch.setattr(module, "write_multiband_median", counting_median)
+    result = CopernicusMonthlyProcessor(config).run()
+
+    assert result.reflectance_path.is_file()
+    assert result.indices_path.is_file()
+    assert len(recomputed) == 1, f"resume recomputed {recomputed}, expected only the lost tile"
+    # A completed month must not leave the tile medians behind as scratch.
+    assert not checkpoint.exists()
+
+
+
+def test_parallel_tile_building_matches_serial_output(monkeypatch, tmp_path: Path):
+    """Concurrency must not change the composite.
+
+    Tiles are built out of order once several run at once, but the median's
+    inputs and the mosaic's tile order both have to stay in acquisition order
+    or the result silently depends on scheduling.
+    """
+
+    import terravault.copernicus_monthly as module
+
+    def build(root: Path, workers: int) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        database_path = root / "dataset.duckdb"
+        database_path.write_bytes(b"catalog-placeholder")
+        pieces = _real_scene_pieces(root, item_id="scene-a", tile_id="32TMT", day=6)
+        pieces += _real_scene_pieces(root, item_id="scene-b", tile_id="32TNT", day=7)
+        pieces += _real_scene_pieces(root, item_id="scene-c", tile_id="32TLS", day=8)
+
+        class FakeDatasetCatalog:
+            def __init__(self, path: Path) -> None:
+                assert path == database_path
+
+            def query_raster_pieces(self, **_kwargs: Any) -> list[dict[str, Any]]:
+                return pieces
+
+        monkeypatch.setattr(
+            "terravault.copernicus_monthly.DatasetCatalog", FakeDatasetCatalog
+        )
+        monkeypatch.setattr(module, "_SCENE_WORKERS", workers)
+        monkeypatch.setattr(module, "_TILE_WORKERS", workers)
+        monkeypatch.setattr(module, "_MEDIAN_WORKERS", workers)
+        config = CopernicusMonthlyConfig(
+            dataset_db=database_path,
+            output_root=root / "monthly",
+            year=2024,
+            month=6,
+            bbox=(7.0, 46.5, 8.0, 47.0),
+            resolution=500.0,
+            max_output_gib=1.0,
+            staging_root=root / "staging",
+        )
+        return CopernicusMonthlyProcessor(config).run().reflectance_path
+
+    def checksums(path: Path) -> list[int]:
+        info = json.loads(
+            subprocess.run(
+                ["gdalinfo", "-json", "-checksum", str(path)],
+                check=True, capture_output=True, text=True,
+            ).stdout
+        )
+        return [band["checksum"] for band in info["bands"]]
+
+    serial = checksums(build(tmp_path / "serial", workers=1))
+    parallel = checksums(build(tmp_path / "parallel", workers=4))
+    assert serial == parallel, f"parallel output differs: {serial} != {parallel}"
+
+
+def test_selection_accepts_assets_staged_locally_when_archive_is_offline(
+    monkeypatch, tmp_path: Path
+):
+    """A staged input must not be rejected because the archive is unmounted.
+
+    Inputs are copied to the local staging root precisely so a run does not
+    depend on the network share; selection has to honour that or an unmounted
+    share fails the run before any work starts.
+    """
+
+    database_path = tmp_path / "dataset.duckdb"
+    database_path.write_bytes(b"catalog-placeholder")
+    config = CopernicusMonthlyConfig(
+        dataset_db=database_path,
+        output_root=tmp_path / "monthly",
+        year=2024,
+        month=7,
+        staging_root=tmp_path / "staging",
+        dry_run=True,
+    )
+    monkeypatch.setattr(
+        "terravault.copernicus_monthly.DatasetCatalog", lambda path: object()
+    )
+    processor = CopernicusMonthlyProcessor(config)
+
+    offline_archive = Path("/Volumes/definitely-not-mounted/B03_10m.jp2")
+    piece = {
+        "item_id": "scene-a",
+        "asset_key": "B03_10m",
+        "local_path": str(offline_archive),
+        "byte_count": 11,
+        "href": "",
+    }
+    assert not processor._asset_available(piece), "nothing staged yet"
+
+    staged = config.staging_root / "bands" / "scene-a" / "B03_10m.jp2"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(b"staged-band")
+    assert processor._asset_available(piece), "staged copy must satisfy selection"
+
+    # A truncated staged copy is not usable and must not pass.
+    staged.write_bytes(b"short")
+    assert not processor._asset_available(piece)

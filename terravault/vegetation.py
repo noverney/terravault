@@ -83,11 +83,23 @@ def locate_gdal(*names: str) -> dict[str, str]:
     return commands
 
 
+# Per-process GDAL tuning. Several of these commands run concurrently, so
+# these are deliberately per-process budgets rather than whole-machine ones.
+GDAL_CACHE_MIB = os.environ.get("TERRAVAULT_GDAL_CACHE_MIB", "512")
+GDAL_WRITE_THREADS = os.environ.get("TERRAVAULT_GDAL_THREADS", "2")
+
+
 def run_gdal(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """Run one GDAL command without leaking credentials into the log."""
 
     logger.debug("Running GDAL command: %s", " ".join(arguments))
     environment = os.environ.copy()
+    # Block cache and compression threads are both left at GDAL's small
+    # defaults otherwise, which shows up as jobs using well under one core
+    # while waiting on I/O. Keep them modest: these commands run several at a
+    # time, so the budget is per process, not per machine.
+    environment.setdefault("GDAL_CACHEMAX", GDAL_CACHE_MIB)
+    environment.setdefault("GDAL_NUM_THREADS", GDAL_WRITE_THREADS)
     environment.setdefault("GDAL_HTTP_MULTIRANGE", "YES")
     environment.setdefault("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
     environment.setdefault("GDAL_HTTP_TIMEOUT", "120")
@@ -337,6 +349,8 @@ def write_multiband_median(
             "BIGTIFF=YES",
             "--co",
             "TILED=YES",
+            "--co",
+            f"NUM_THREADS={GDAL_WRITE_THREADS}",
             "--hideNoData",
             "--extent",
             "union",
