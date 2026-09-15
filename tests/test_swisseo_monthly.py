@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from terravault.cli import build_parser
-from terravault.swisseo import SWISSEO_COLLECTION, SWISSEO_STAC_URL
+from terravault.swisseo import SWISSEO_COLLECTION, SWISSEO_STAC_URL, SWISSEO_V200_COLLECTION
 from terravault.swisseo_monthly import (
     SwissEOMonthlyConfig,
     SwissEOMonthlyProcessor,
@@ -19,6 +19,20 @@ from terravault.swisseo_monthly import (
     _replace_after_reconnect,
 )
 from terravault.vegetation import REFLECTANCE_BAND_NAMES
+
+requires_gdal_cli = pytest.mark.skipif(
+    any(
+        shutil.which(command) is None
+        for command in (
+            "gdal_create",
+            "gdal_calc.py",
+            "gdalbuildvrt",
+            "gdalwarp",
+            "gdalinfo",
+        )
+    ),
+    reason="GDAL command-line tools are not installed",
+)
 
 
 def _item(item_id: str, timestamp: str) -> dict[str, Any]:
@@ -273,20 +287,9 @@ def test_monthly_median_uses_one_spectral_band_per_calculation(
     assert "INTERLEAVE=BAND" in translate_command
 
 
-@pytest.mark.skipif(
-    any(
-        shutil.which(command) is None
-        for command in (
-            "gdal_create",
-            "gdal_calc.py",
-            "gdalbuildvrt",
-            "gdalwarp",
-            "gdalinfo",
-        )
-    ),
-    reason="GDAL command-line tools are not installed",
-)
-def test_swisseo_monthly_runs_end_to_end_across_all_orbit_items(tmp_path: Path):
+def _build_local_month(tmp_path: Path):
+    """Build two on-disk swissEO orbit mosaics and a client that serves them."""
+
     items: list[dict[str, Any]] = []
     metadata: dict[str, dict[str, Any]] = {}
     for scene_number in (1, 2):
@@ -384,6 +387,12 @@ def test_swisseo_monthly_runs_end_to_end_across_all_orbit_items(tmp_path: Path):
         def get_metadata(self, item: dict[str, Any]):
             return metadata[str(item["id"])]
 
+    return LocalMonthlyClient()
+
+
+@requires_gdal_cli
+def test_swisseo_monthly_runs_end_to_end_across_all_orbit_items(tmp_path: Path):
+    client = _build_local_month(tmp_path)
     staging_root = tmp_path / "local-staging"
     result = SwissEOMonthlyProcessor(
         SwissEOMonthlyConfig(
@@ -396,7 +405,7 @@ def test_swisseo_monthly_runs_end_to_end_across_all_orbit_items(tmp_path: Path):
             max_temporary_gib=1.0,
             temporary_root=staging_root,
         ),
-        client=LocalMonthlyClient(),
+        client=client,
     ).run()
 
     assert result.reflectance_path.is_file()
@@ -423,3 +432,253 @@ def test_swisseo_monthly_runs_end_to_end_across_all_orbit_items(tmp_path: Path):
     )
     expected = (0.4 / 1.02, 0.3 / 1.12, 0.33 / 1.05, 0.35 / 1.07)
     assert [band["mean"] for band in info["bands"]] == pytest.approx(expected, abs=5e-4)
+
+
+@requires_gdal_cli
+def test_interrupted_run_keeps_aligned_items_and_resumes_from_them(tmp_path: Path):
+    """A failure after alignment must not discard the staged orbit mosaics.
+
+    Aligning one orbit costs a multi-gigabyte download plus three warps, and a
+    single transient read timeout from the publication host used to throw all
+    of it away with the TemporaryDirectory.
+    """
+
+    client = _build_local_month(tmp_path)
+    staging_root = tmp_path / "local-staging"
+    config = SwissEOMonthlyConfig(
+        output_root=tmp_path / "monthly",
+        year=2024,
+        month=6,
+        bbox=(7.0, 46.5, 8.0, 47.0),
+        resolution=500.0,
+        max_output_gib=1.0,
+        max_temporary_gib=1.0,
+        temporary_root=staging_root,
+    )
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def explode(self, **kwargs):
+        raise Interrupted("publication host dropped the connection")
+
+    original = SwissEOMonthlyProcessor._monthly_reflectance_median
+    SwissEOMonthlyProcessor._monthly_reflectance_median = explode
+    try:
+        with pytest.raises(Interrupted):
+            SwissEOMonthlyProcessor(config, client=client).run()
+    finally:
+        SwissEOMonthlyProcessor._monthly_reflectance_median = original
+
+    checkpoint = staging_root / "checkpoints" / config.stem
+    survivors = sorted(path.name for path in checkpoint.glob("item-*"))
+    assert survivors == ["item-001", "item-002"], (
+        f"expected both aligned items to survive the failure, got {survivors}"
+    )
+    assert (checkpoint / "item-001" / "aligned.json").is_file()
+    # No download must be repeated on the resumed run.
+    downloads: list[str] = []
+    original_download = SwissEOMonthlyProcessor._download_asset
+
+    def counting_download(self, *, href, output):
+        downloads.append(output.name)
+        return original_download(self, href=href, output=output)
+
+    SwissEOMonthlyProcessor._download_asset = counting_download
+    try:
+        result = SwissEOMonthlyProcessor(config, client=client).run()
+    finally:
+        SwissEOMonthlyProcessor._download_asset = original_download
+
+    assert result.reflectance_path.is_file()
+    assert result.indices_path.is_file()
+    assert downloads == [], f"resumed run re-staged assets: {downloads}"
+    # A finished month must not leave its staging behind.
+    assert not checkpoint.exists()
+
+
+def test_v200_is_opt_in_and_never_reuses_v100_names(tmp_path: Path):
+    v100 = SwissEOMonthlyConfig(output_root=tmp_path, year=2023, month=7, resolution=10.0)
+    v200 = SwissEOMonthlyConfig(
+        output_root=tmp_path, year=2023, month=7, resolution=10.0, product_version="v200"
+    )
+
+    assert v100.product_version == "v100"
+    assert v100.collection == SWISSEO_COLLECTION
+    assert v100.stem == "switzerland_swisseo_s2_sr_2023_07_10m"
+    assert v200.collection == SWISSEO_V200_COLLECTION
+    assert v200.stem == "switzerland_swisseo_s2_sr_v200_2023_07_10m"
+    # A v200 quality rule must never be pointed at another collection's data.
+    with pytest.raises(ValueError, match="reads"):
+        SwissEOMonthlyConfig(
+            output_root=tmp_path, year=2023, month=7,
+            product_version="v200", collection="ch.example.other",
+        )
+    with pytest.raises(ValueError, match="Unknown swissEO product version"):
+        SwissEOMonthlyConfig(output_root=tmp_path, year=2023, month=7, product_version="v300")
+
+
+def test_swisseo_monthly_cli_defaults_to_v100_and_accepts_v200():
+    default = build_parser().parse_args(["swisseo-monthly", "--year", "2023"])
+    chosen = build_parser().parse_args(
+        ["swisseo-monthly", "--year", "2023", "--product-version", "v200"]
+    )
+
+    assert default.product_version == "v100"
+    assert default.collection is None
+    assert chosen.product_version == "v200"
+
+
+def test_median_expression_follows_the_product_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def expression_for(version: str) -> str:
+        processor = SwissEOMonthlyProcessor(
+            SwissEOMonthlyConfig(
+                output_root=tmp_path / version, year=2024, month=6,
+                dry_run=True, product_version=version,
+            ),
+            client=FakeMonthlyClient(),
+        )
+        processor._gdal = {
+            "gdal_calc.py": "gdal_calc.py",
+            "gdal_translate": "gdal_translate",
+            "gdalbuildvrt": "gdalbuildvrt",
+        }
+        commands: list[tuple[str, ...]] = []
+        monkeypatch.setattr(
+            "terravault.swisseo_monthly.run_gdal", lambda command: commands.append(tuple(command))
+        )
+        monkeypatch.setattr(
+            "terravault.swisseo_monthly.set_vrt_band_descriptions", lambda path, names: None
+        )
+        aligned = [
+            {
+                **{band: tmp_path / f"{n}-{band}.vrt" for band in REFLECTANCE_BAND_NAMES},
+                "TERRAIN_MASK": tmp_path / f"{n}-t.vrt",
+                "CLOUD_MASK": tmp_path / f"{n}-q.vrt",
+            }
+            for n in (1, 2)
+        ]
+        processor._monthly_reflectance_median(
+            aligned_items=aligned, output=tmp_path / f"{version}.tif"
+        )
+        calc = next(command for command in commands if command[0] == "gdal_calc.py")
+        return calc[calc.index("--calc") + 1]
+
+    v100 = expression_for("v100")
+    v200 = expression_for("v200")
+
+    # v100 must keep exactly the rule and scaling it always had.
+    assert "A!=9999,T!=255,Q!=255,Q!=1,T!=100" in v100
+    assert "A*0.001," in v100
+    assert "A!=0,T<90,Q==0" in v200
+    assert "(A*0.0001-0.1)" in v200
+
+
+def _build_local_v200_month(tmp_path: Path):
+    """Four v200 orbits where only the first one is usable.
+
+    Each of the other three is rejected by exactly one part of the v200 rule
+    and carries values that would visibly move the median if it leaked in:
+    thin cloud (class 2 - survives a rule that only drops thick cloud),
+    a self-shadowed slope (incidence 120 - survives a rule that only drops the
+    cast-shadow value), and cast shadow (200).
+    """
+
+    usable = {"b03": 1700, "b04": 1500, "b08": 4000, "b05": 1800, "b8a": 4200, "b11": 2800}
+    leaky = {"b03": 9000, "b04": 9000, "b08": 1100, "b05": 9000, "b8a": 1100, "b11": 9000}
+    orbits = [("2024-06-01t101559", usable, 0, 45),
+              ("2024-06-02t101559", leaky, 2, 45),
+              ("2024-06-03t101559", leaky, 0, 120),
+              ("2024-06-04t101559", leaky, 0, 200)]
+
+    def raster(path: Path, size: tuple[int, int], value: int, kind: str, nodata: str | None):
+        command = ["gdal_create", "-of", "GTiff", "-ot", kind,
+                   "-outsize", str(size[0]), str(size[1]), "-bands", "1", "-burn", str(value),
+                   "-a_srs", "EPSG:4326", "-a_ullr", "7.0", "47.0", "8.0", "46.5"]
+        if nodata is not None:
+            command.extend(("-a_nodata", nodata))
+        subprocess.run([*command, str(path)], check=True, capture_output=True, text=True)
+
+    items: list[dict[str, Any]] = []
+    for item_id, values, cloud, terrain in orbits:
+        root = tmp_path / item_id
+        root.mkdir()
+        assets: dict[str, dict[str, Any]] = {}
+
+        def add(name: str, size, value: int, kind: str, nodata: str | None) -> None:
+            key = f"swisseo_s2-sr_v200_mosaic_{item_id}_{name}.tif"
+            raster(root / key, size, value, kind, nodata)
+            assets[key] = {"title": name, "href": str(root / key)}
+
+        for band in ("b03", "b04", "b08"):
+            add(f"{band}_10m", (100, 50), values[band], "UInt16", "0")
+        for band in ("b05", "b8a", "b11"):
+            add(f"{band}_20m", (50, 25), values[band], "UInt16", "0")
+        add("cloudmask_10m", (100, 50), cloud, "Byte", None)
+        add("terrainmask_10m", (100, 50), terrain, "Byte", "255")
+        assets["metadata"] = {"title": "Metadata", "href": str(root / "metadata.json")}
+        items.append({
+            "type": "Feature", "id": item_id, "collection": SWISSEO_V200_COLLECTION,
+            "bbox": [7.0, 46.5, 8.0, 47.0],
+            "properties": {"datetime": f"{item_id[:10]}T10:15:59Z"}, "assets": assets,
+        })
+
+    class LocalV200Client:
+        stac_url = SWISSEO_STAC_URL
+        collection = SWISSEO_V200_COLLECTION
+
+        def search_month(self, *, year: int, month: int):
+            return tuple(items)
+
+        def get_metadata(self, item: dict[str, Any]):
+            return {"PROPERTIES": {"CLOUDPERCENTAGE": "12.5"},
+                    "SOURCE": {"GRANULES": {"g1": {}, "g2": {}}}}
+
+    return LocalV200Client()
+
+
+@requires_gdal_cli
+def test_v200_month_applies_offset_and_rejects_cloud_and_terrain_shadow(tmp_path: Path):
+    result = SwissEOMonthlyProcessor(
+        SwissEOMonthlyConfig(
+            output_root=tmp_path / "monthly",
+            year=2024,
+            month=6,
+            bbox=(7.0, 46.5, 8.0, 47.0),
+            resolution=500.0,
+            max_output_gib=1.0,
+            max_temporary_gib=1.0,
+            temporary_root=tmp_path / "staging",
+            product_version="v200",
+        ),
+        client=_build_local_v200_month(tmp_path),
+    ).run()
+
+    assert "_s2_sr_v200_" in result.reflectance_path.name
+    assert result.item_count == 4
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["product_version"] == "v200"
+    assert manifest["collection"] == SWISSEO_V200_COLLECTION
+    assert manifest["reflectance_scaling"] == {"scale": 0.0001, "offset": -0.1, "nodata": 0}
+    assert manifest["average_source_percent_cloud"] == pytest.approx(12.5)
+    assert manifest["average_source_percent_masked"] is None
+
+    def means(path: Path) -> list[float]:
+        info = json.loads(subprocess.run(
+            ["gdalinfo", "-json", "-stats", str(path)],
+            check=True, capture_output=True, text=True,
+        ).stdout)
+        return [band["mean"] for band in info["bands"]]
+
+    # Only the clear orbit survives, so the median is exactly its reflectance:
+    # stored value x 0.0001 - 0.1.  Without the offset B04 would read 0.15.
+    assert means(result.reflectance_path) == pytest.approx(
+        [0.07, 0.05, 0.08, 0.30, 0.32, 0.18], abs=5e-4
+    )  # B03 B04 B05 B08 B8A B11
+    # NDVI would be 0.4545 without the offset, and any leaked orbit drags it down.
+    assert means(result.indices_path) == pytest.approx(
+        [0.25 / 0.35, 0.23 / 0.37, 0.24 / 0.40, 0.12 / 0.48], abs=5e-4
+    )  # NDVI GNDVI NDRE NDWI

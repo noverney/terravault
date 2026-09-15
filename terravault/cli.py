@@ -550,13 +550,14 @@ def cmd_swisseo_monthly(args: argparse.Namespace) -> int:
 
     from .catalog import SWITZERLAND_BBOX
     from .rolling import load_roi
-    from .swisseo import SwissEOClient
+    from .swisseo import SwissEOClient, swisseo_product_version
     from .swisseo_monthly import SwissEOMonthlyConfig, SwissEOMonthlyProcessor
 
     try:
         bbox = list(SWITZERLAND_BBOX) if args.bbox is None and args.roi is None else args.bbox
         roi = load_roi(bbox=bbox, geojson_path=args.roi)
-        client = SwissEOClient(stac_url=args.stac_url, collection=args.collection)
+        collection = args.collection or swisseo_product_version(args.product_version).collection
+        client = SwissEOClient(stac_url=args.stac_url, collection=collection)
         results = [
             SwissEOMonthlyProcessor(
                 SwissEOMonthlyConfig(
@@ -566,7 +567,8 @@ def cmd_swisseo_monthly(args: argparse.Namespace) -> int:
                     bbox=roi.bbox,
                     cutline_path=None if args.roi is None else Path(args.roi),
                     stac_url=args.stac_url,
-                    collection=args.collection,
+                    collection=collection,
+                    product_version=args.product_version,
                     target_crs=args.target_crs,
                     resolution=args.resolution,
                     compression=args.compression,
@@ -1919,9 +1921,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Public swisstopo STAC API; no token is required",
     )
     swisseo_monthly_p.add_argument(
+        "--product-version",
+        choices=("v100", "v200"),
+        default="v100",
+        help=(
+            "swissEO S2-SR product version (default: v100). v200 uses per-band assets, "
+            "OmniCloudMask cloud classes and scale 0.0001 with offset -0.1; its files are "
+            "named ..._s2_sr_v200_... so they never replace v100 products"
+        ),
+    )
+    swisseo_monthly_p.add_argument(
         "--collection",
-        default="ch.swisstopo.swisseo_s2-sr_v100",
+        default=None,
         metavar="ID",
+        help="STAC collection (default: the collection of --product-version)",
     )
     swisseo_monthly_p.add_argument(
         "--output-root",

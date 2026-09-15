@@ -55,6 +55,133 @@ SWISSEO_TERRAIN_SHADOW = 100
 SWISSEO_ATTRIBUTION_TEMPLATE = (
     "© swisstopo, Contains modified Copernicus Sentinel data {year}"
 )
+SWISSEO_V200_COLLECTION = "ch.swisstopo.swisseo_s2-sr_v200"
+
+
+@dataclass(frozen=True)
+class SwissEOProductVersion:
+    """Everything that differs between swissEO S2-SR product versions.
+
+    The monthly route stacks each version's inputs into the same local layout
+    (a 10 m band stack, a 20 m band stack, and a terrain/cloud mask pair), so
+    only asset selection, reflectance scaling and the quality rule vary here.
+    """
+
+    name: str
+    collection: str
+    reflectance_scale: float
+    reflectance_offset: float
+    reflectance_nodata: int
+    mask_nodata: int
+    # Band names in the order they occupy the stacked 10 m and 20 m inputs.
+    bands_10m: tuple[str, ...]
+    bands_20m: tuple[str, ...]
+    # gdal_calc terms over T (terrain) and Q (cloud) that a valid pixel meets.
+    valid_mask_terms: tuple[str, ...]
+    quality_rule: str
+    # Inserted into product filenames; empty keeps the original v100 names.
+    stem_tag: str
+    # v200 publishes one file per band; v100 bundles bands in titled assets.
+    per_band_assets: bool
+
+    def physical_reflectance(self, variable: str) -> str:
+        """gdal_calc expression converting stored values to reflectance."""
+
+        if self.reflectance_offset == 0:
+            return f"{variable}*{self.reflectance_scale!r}"
+        sign = "-" if self.reflectance_offset < 0 else "+"
+        return f"({variable}*{self.reflectance_scale!r}{sign}{abs(self.reflectance_offset)!r})"
+
+
+SWISSEO_V100 = SwissEOProductVersion(
+    name="v100",
+    collection=SWISSEO_COLLECTION,
+    reflectance_scale=SWISSEO_REFLECTANCE_SCALE,
+    reflectance_offset=0.0,
+    reflectance_nodata=SWISSEO_REFLECTANCE_NODATA,
+    mask_nodata=SWISSEO_MASK_NODATA,
+    bands_10m=(),
+    bands_20m=(),
+    valid_mask_terms=(
+        f"T!={SWISSEO_MASK_NODATA}",
+        f"Q!={SWISSEO_MASK_NODATA}",
+        f"Q!={SWISSEO_CLOUD_OR_SHADOW}",
+        f"T!={SWISSEO_TERRAIN_SHADOW}",
+    ),
+    quality_rule=(
+        "valid when the cloud mask is not 1 (cloud or cloud shadow), the terrain "
+        "mask is not 100 (terrain shadow), and neither mask is nodata (255)"
+    ),
+    stem_tag="",
+    per_band_assets=False,
+)
+
+# v200 facts were checked against the published data, not only the collection
+# text: bands are UInt16 with nodata 0 and carry no GDAL scale/offset, so the
+# documented scale 0.0001 and offset -0.1 must be applied here (an offset does
+# not cancel in a normalised difference).  The cloud mask holds OmniCloudMask
+# classes 0 clear, 1 thick cloud, 2 thin cloud, 3 cloud shadow; class 0 also
+# fills the area outside the orbit, so "clear" only counts where a band has
+# data.  The terrain mask holds the solar incidence angle (0-180), 200 for cast
+# shadow and 255 nodata; angles of 90 or more face away from the sun.
+# The terrain mask is 255 over lakes and rivers, so rejecting nodata also drops
+# open water (~3.5% of Switzerland, measured on July 2026).  That is kept on
+# purpose: v200 is a vegetation product and water is excluded, unlike v100.
+SWISSEO_V200 = SwissEOProductVersion(
+    name="v200",
+    collection=SWISSEO_V200_COLLECTION,
+    reflectance_scale=0.0001,
+    reflectance_offset=-0.1,
+    reflectance_nodata=0,
+    mask_nodata=255,
+    bands_10m=("B03", "B04", "B08"),
+    bands_20m=("B05", "B8A", "B11"),
+    valid_mask_terms=("T<90", "Q==0"),
+    quality_rule=(
+        "valid when the OmniCloudMask class is 0 (clear; thick cloud 1, thin cloud 2 "
+        "and cloud shadow 3 are rejected) and the solar incidence angle is below 90 "
+        "degrees (self-shadowed slopes 90-180, cast shadow 200 and nodata 255 are "
+        "rejected), and the reflectance band is not nodata (0). The terrain mask has "
+        "no value over lakes and rivers, so v200 composites exclude open water"
+    ),
+    stem_tag="_v200",
+    per_band_assets=True,
+)
+
+SWISSEO_PRODUCT_VERSIONS: dict[str, SwissEOProductVersion] = {
+    version.name: version for version in (SWISSEO_V100, SWISSEO_V200)
+}
+
+
+def swisseo_product_version(name: str) -> SwissEOProductVersion:
+    try:
+        return SWISSEO_PRODUCT_VERSIONS[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown swissEO product version {name!r}; "
+            f"choose one of {', '.join(SWISSEO_PRODUCT_VERSIONS)}"
+        ) from None
+
+
+def swisseo_v200_asset(item: Mapping[str, Any], name: str) -> dict[str, Any]:
+    """Select one v200 per-band asset, e.g. ``b8a_20m`` or ``cloudmask_10m``.
+
+    v200 asset titles are prose ("NIR 2 (band 8A) - 20m"), so match the stable
+    ``_<name>.tif`` key suffix instead.
+    """
+
+    suffix = f"_{name.casefold()}.tif"
+    matches = [
+        dict(asset)
+        for key, asset in (item.get("assets") or {}).items()
+        if str(key).casefold().endswith(suffix)
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"swissEO item {item.get('id')} has {len(matches)} assets ending in "
+            f"{suffix!r}; exactly one is required"
+        )
+    return matches[0]
 _FLOAT32_BYTES = 4
 _VARIABLES = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
