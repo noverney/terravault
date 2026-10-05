@@ -9,13 +9,15 @@ keeps a queryable DuckDB catalogue of both inputs and generated images.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import uuid
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -26,7 +28,13 @@ import pystac
 from .auth import CDSEDownloadAuthConfig
 from .catalog import COPERNICUS_STAC_URL, CatalogClient
 from .force import FORCE_DOCKER_IMAGE, FORCE_DOCKER_PLATFORM
-from .force_level2 import ForceLevel2Config, ForceLevel2Processor, ForceLevel2Result
+from .force_level2 import (
+    ForceLevel2Cancelled,
+    ForceLevel2Config,
+    ForceLevel2Processor,
+    ForceLevel2Result,
+    default_force_threads,
+)
 from .l1c_download import L1CDownloadConfig, L1CDownloadResult, L1CProductDownloader
 from .s3_downloader import S3Config
 
@@ -157,14 +165,26 @@ class ForceLevel2Options:
     max_cloud_cover_frame: int = 100
     max_cloud_cover_tile: int = 100
     resolution_merge: str = "IMPROPHE"
+    # FORCE NPROC. TerraVault gives FORCE one SAFE per queue, so this does not
+    # parallelise scenes; ``scene_workers`` does.
     processes: int = 1
-    threads: int = 2
+    # OpenMP threads per scene; None shares the CPUs between scene workers.
+    threads: int | None = None
     parallel_reads: bool = False
+    # SAFE products processed concurrently, each in its own FORCE job. One
+    # Sentinel-2 scene needs roughly 8 GiB, so memory usually sets the limit.
+    scene_workers: int = 1
     output_overview: bool = True
     overwrite: bool = False
     retry_failed: bool = False
     dry_run: bool = False
     progress_interval_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.scene_workers < 1:
+            raise ValueError("scene_workers must be at least 1")
+        if self.threads is not None and self.threads < 1:
+            raise ValueError("threads must be at least 1")
 
     def config(self, *, input_path: Path, output_root: Path) -> ForceLevel2Config:
         """Create the validated per-scene configuration used by L2PS."""
@@ -194,7 +214,11 @@ class ForceLevel2Options:
             max_cloud_cover_tile=self.max_cloud_cover_tile,
             resolution_merge=self.resolution_merge,
             nproc=self.processes,
-            nthread=self.threads,
+            nthread=(
+                default_force_threads(self.scene_workers)
+                if self.threads is None
+                else self.threads
+            ),
             parallel_reads=self.parallel_reads,
             output_overview=self.output_overview,
             overwrite=self.overwrite,
@@ -211,7 +235,10 @@ class ForcePipelineConfig:
     Exactly one of ``bbox`` and ``intersects`` is required.  The catalogue
     cloud threshold is applied before any full SAFE is downloaded.  FORCE's
     own frame/tile cloud thresholds remain separately configurable through
-    :class:`ForceLevel2Options`.
+    :class:`ForceLevel2Options`.  ``clip_to_selection`` passes the discovery
+    geometry to FORCE as its AOI, so tiles outside it are not written; FORCE
+    applies it before adjacency correction, which changes reflectance near
+    its edge.
     """
 
     output_root: Path
@@ -230,6 +257,7 @@ class ForcePipelineConfig:
     auth: CDSEDownloadAuthConfig | None = None
     download: ForceDownloadOptions = field(default_factory=ForceDownloadOptions)
     force: ForceLevel2Options = field(default_factory=ForceLevel2Options)
+    clip_to_selection: bool = False
 
     def __post_init__(self) -> None:
         output_root = _absolute(self.output_root)
@@ -259,6 +287,8 @@ class ForcePipelineConfig:
             object.__setattr__(self, "database_path", _absolute(self.database_path))
         if self.queue_path is not None:
             object.__setattr__(self, "queue_path", _absolute(self.queue_path))
+        if self.clip_to_selection and self.force.aoi_path is not None:
+            raise ValueError("clip_to_selection cannot be combined with a FORCE aoi_path")
 
     @property
     def effective_database_path(self) -> Path:
@@ -827,12 +857,52 @@ class ForcePipeline:
             text += "\n"
         _write_text_atomic(self.config.effective_queue_path, text)
 
+    def _selection_aoi_path(self) -> Path:
+        """Write the discovery geometry once as a FORCE AOI inside the output root."""
+
+        if self.config.intersects is not None:
+            geometry = self.config.intersects
+        else:
+            west, south, east, north = self.config.bbox or (0.0, 0.0, 0.0, 0.0)
+            geometry = {
+                "type": "Polygon",
+                "coordinates": [
+                    [[west, south], [east, south], [east, north], [west, north], [west, south]]
+                ],
+            }
+        text = json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [{"type": "Feature", "properties": {}, "geometry": geometry}],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        path = (
+            self.config.output_root
+            / "_terravault"
+            / "force-pipeline"
+            / "aoi"
+            / f"selection-{digest}.geojson"
+        )
+        # Content-addressed and never rewritten: FORCE job fingerprints include
+        # the AOI file's size and modification time.
+        if not path.is_file():
+            _write_text_atomic(path, text)
+        return path
+
     def run(self, *, download: bool = True, process: bool = True) -> ForcePipelineResult:
         """Execute discovery and optionally download/process every selected scene.
 
         ``download=False, process=False`` is the metadata-only mode.  Processing
         without downloading is supported when the catalogue already contains a
         valid local product path from an earlier run.
+
+        Downloads run on the calling thread.  Each complete SAFE is handed to a
+        pool of ``force.scene_workers`` threads, each driving one FORCE job, so
+        transfers continue while earlier scenes are processed.  Catalogue
+        writes stay on the calling thread.
         """
 
         run_id = self.database.start_run(self._selection_payload())
@@ -844,15 +914,160 @@ class ForcePipeline:
         processing_skipped = 0
         errors: list[str] = []
         image_paths: list[Path] = []
+        force_options = self.config.force
+        executor: ThreadPoolExecutor | None = None
+        # Submitted FORCE jobs: future -> (selection order, item id, processor).
+        pending: dict[Future[ForceLevel2Result], tuple[int, str, Any]] = {}
+        # The item and stage the calling thread is working on, if any.
+        active: tuple[str, str] | None = None
 
-        def persist_interruption(
-            exc: BaseException,
-            *,
-            item_id: str | None = None,
-            stage: str | None = None,
-        ) -> None:
+        def finish_processing(future: Future[ForceLevel2Result]) -> None:
+            nonlocal processed, processing_skipped
+            item_id = pending[future][1]
+            try:
+                force_result = future.result()
+            except Exception as exc:  # noqa: BLE001
+                del pending[future]
+                error = f"FORCE processing failed for {item_id}: {exc}"
+                logger.error(error, exc_info=exc)
+                self.database.record_error(item_id, stage="force", error=str(exc))
+                errors.append(error)
+            else:
+                del pending[future]
+                image_paths.extend(self.database.record_force(item_id, force_result))
+                if force_result.skipped:
+                    processing_skipped += 1
+                elif force_result.status == "complete":
+                    processed += 1
+            self._write_force_queue()
+
+        def collect_finished(*, block: bool) -> None:
+            if not pending:
+                return
+            done, _ = wait(
+                tuple(pending),
+                timeout=None if block else 0,
+                return_when=FIRST_COMPLETED,
+            )
+            for future in sorted(done, key=lambda future: pending[future][0]):
+                finish_processing(future)
+
+        def stop_processing() -> list[tuple[str, str]]:
+            """Cancel running FORCE jobs; return the ones left interrupted."""
+
+            for _order, _item_id, processor in pending.values():
+                cancel = getattr(processor, "cancel", None)
+                if cancel is not None:
+                    cancel()
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+            stopped: list[tuple[str, str]] = []
+            for future in sorted(pending, key=lambda future: pending[future][0]):
+                item_id = pending[future][1]
+                if future.cancelled():
+                    del pending[future]
+                    continue
+                exc = future.exception()
+                if exc is None or (
+                    isinstance(exc, Exception) and not isinstance(exc, ForceLevel2Cancelled)
+                ):
+                    finish_processing(future)
+                else:
+                    del pending[future]
+                    stopped.append((item_id, "force"))
+            return stopped
+
+        try:
+            try:
+                discovered, selected = self.discover()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                error = f"Catalog discovery failed: {exc}"
+                logger.exception(error)
+                errors.append(error)
+            else:
+                if process:
+                    if self.config.clip_to_selection:
+                        force_options = replace(
+                            force_options,
+                            aoi_path=self._selection_aoi_path(),
+                        )
+                    executor = ThreadPoolExecutor(
+                        max_workers=force_options.scene_workers,
+                        thread_name_prefix="force-scene",
+                    )
+                for order, item in enumerate(selected):
+                    active = (item.id, "download")
+                    try:
+                        _product_name, metadata_path = self._persist_item(item)
+                    except Exception as exc:  # noqa: BLE001
+                        error = f"Could not persist selected item {item.id}: {exc}"
+                        logger.exception(error)
+                        errors.append(error)
+                        active = None
+                        continue
+
+                    product_path = self.database.product_path(item.id)
+                    if download:
+                        try:
+                            download_result = self.downloader_factory(
+                                self.config.download.config(
+                                    item_path=metadata_path,
+                                    output_root=self.config.output_root,
+                                    s3=self.config.s3,
+                                    auth=self.config.auth,
+                                )
+                            ).run()
+                            self.database.record_download(item.id, download_result)
+                            product_path = download_result.product_path
+                            if download_result.skipped:
+                                downloads_skipped += 1
+                            else:
+                                downloaded += 1
+                            image_paths.append(download_result.product_path)
+                            self._write_force_queue()
+                        except Exception as exc:  # noqa: BLE001
+                            error = f"L1C download failed for {item.id}: {exc}"
+                            logger.exception(error)
+                            self.database.record_error(
+                                item.id, stage="download", error=str(exc)
+                            )
+                            errors.append(error)
+                            self._write_force_queue()
+                            active = None
+                            continue
+                    active = None
+
+                    if process:
+                        if product_path is None or not product_path.exists():
+                            error = (
+                                f"FORCE processing skipped for {item.id}: "
+                                "no complete local L1C SAFE"
+                            )
+                            self.database.record_error(item.id, stage="force", error=error)
+                            errors.append(error)
+                        else:
+                            assert executor is not None
+                            active = (item.id, "force")
+                            processor = self.processor_factory(
+                                force_options.config(
+                                    input_path=product_path,
+                                    output_root=self.config.output_root,
+                                )
+                            )
+                            future = executor.submit(processor.run)
+                            pending[future] = (order, item.id, processor)
+                            active = None
+                    collect_finished(block=False)
+                active = None
+                while pending:
+                    collect_finished(block=True)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            stopped = [] if active is None else [active]
+            stopped.extend(stop_processing())
             message = f"{type(exc).__name__}: {exc}"
-            if item_id is not None and stage is not None:
+            for item_id, stage in stopped:
                 self.database.record_error(
                     item_id,
                     stage=stage,
@@ -872,90 +1087,10 @@ class ForcePipeline:
                 processed=processed,
                 error=message,
             )
-
-        try:
-            discovered, selected = self.discover()
-        except (KeyboardInterrupt, SystemExit) as exc:
-            persist_interruption(exc)
             raise
-        except Exception as exc:  # noqa: BLE001
-            error = f"Catalog discovery failed: {exc}"
-            logger.exception(error)
-            errors.append(error)
-        else:
-            for item in selected:
-                try:
-                    _product_name, metadata_path = self._persist_item(item)
-                except (KeyboardInterrupt, SystemExit) as exc:
-                    persist_interruption(exc, item_id=item.id, stage="download")
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    error = f"Could not persist selected item {item.id}: {exc}"
-                    logger.exception(error)
-                    errors.append(error)
-                    continue
-
-                product_path = self.database.product_path(item.id)
-                if download:
-                    try:
-                        download_result = self.downloader_factory(
-                            self.config.download.config(
-                                item_path=metadata_path,
-                                output_root=self.config.output_root,
-                                s3=self.config.s3,
-                                auth=self.config.auth,
-                            )
-                        ).run()
-                        self.database.record_download(item.id, download_result)
-                        product_path = download_result.product_path
-                        if download_result.skipped:
-                            downloads_skipped += 1
-                        else:
-                            downloaded += 1
-                        image_paths.append(download_result.product_path)
-                        self._write_force_queue()
-                    except (KeyboardInterrupt, SystemExit) as exc:
-                        persist_interruption(exc, item_id=item.id, stage="download")
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        error = f"L1C download failed for {item.id}: {exc}"
-                        logger.exception(error)
-                        self.database.record_error(item.id, stage="download", error=str(exc))
-                        errors.append(error)
-                        self._write_force_queue()
-                        continue
-
-                if not process:
-                    continue
-                if product_path is None or not product_path.exists():
-                    error = (
-                        f"FORCE processing skipped for {item.id}: no complete local L1C SAFE"
-                    )
-                    self.database.record_error(item.id, stage="force", error=error)
-                    errors.append(error)
-                    continue
-                try:
-                    force_result = self.processor_factory(
-                        self.config.force.config(
-                            input_path=product_path,
-                            output_root=self.config.output_root,
-                        )
-                    ).run()
-                    image_paths.extend(self.database.record_force(item.id, force_result))
-                    if force_result.skipped:
-                        processing_skipped += 1
-                    elif force_result.status == "complete":
-                        processed += 1
-                    self._write_force_queue()
-                except (KeyboardInterrupt, SystemExit) as exc:
-                    persist_interruption(exc, item_id=item.id, stage="force")
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    error = f"FORCE processing failed for {item.id}: {exc}"
-                    logger.exception(error)
-                    self.database.record_error(item.id, stage="force", error=str(exc))
-                    errors.append(error)
-                    self._write_force_queue()
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
         self._write_force_queue()
         status = "complete" if not errors else ("partial" if selected else "failed")
@@ -1006,7 +1141,9 @@ def run_force_pipeline(
     max_cloud_cover_frame: int = 100,
     max_cloud_cover_tile: int = 100,
     processes: int = 1,
-    threads: int = 2,
+    threads: int | None = None,
+    scene_workers: int = 1,
+    clip_to_selection: bool = False,
     download: bool = True,
     process: bool = True,
 ) -> ForcePipelineResult:
@@ -1028,6 +1165,7 @@ def run_force_pipeline(
         max_cloud_cover_tile=max_cloud_cover_tile,
         processes=processes,
         threads=threads,
+        scene_workers=scene_workers,
     )
     resolved_s3 = s3
     if resolved_s3 is None:
@@ -1058,6 +1196,7 @@ def run_force_pipeline(
         s3=resolved_s3,
         auth=resolved_auth,
         force=force_options,
+        clip_to_selection=clip_to_selection,
     )
     with ForcePipeline(config) as pipeline:
         return pipeline.run(download=download, process=process)

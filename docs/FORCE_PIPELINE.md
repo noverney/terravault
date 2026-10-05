@@ -41,9 +41,22 @@ terravault force-pipeline \
   --output-root /data/force-native \
   --runtime docker \
   --dem /data/reference/switzerland_dem.tif \
-  --processes 1 \
-  --threads 2
+  --scene-workers 2 \
+  --clip-to-roi
 ```
+
+`--scene-workers N` processes up to N downloaded SAFE products with FORCE at
+the same time while later downloads continue. Each scene needs roughly 8 GiB
+of memory, so on Docker Desktop raise the VM memory limit before raising N.
+`--threads` defaults to the CPU count divided by N. `--clip-to-roi` passes the
+`--roi`/`--bbox` geometry to FORCE as its AOI: pixels outside it become nodata
+and tiles outside it are not written. On T32TMT with the Swiss boundary this
+wrote 22 instead of 25 tiles and 21% fewer bytes, but saved only ~3% of FORCE
+time, because cloud, aerosol and water-vapour estimation still cover the whole
+scene. FORCE applies the AOI before its adjacency correction and resolution
+merge, so reflectance within ~3 km of the AOI edge differs from an unclipped run
+(most changes above 10 DN lie within 1 km). It changes the products, so an
+existing output root processed without it needs `--overwrite` or a new root.
 
 Use `--discover-only` to persist selection/metadata without pixels. Use
 `--download-only` to build and validate the complete Level-1 pool without
@@ -77,8 +90,8 @@ result = run_force_pipeline(
     resolution=10,
     max_cloud_cover_frame=80,
     max_cloud_cover_tile=60,
-    processes=1,
-    threads=2,
+    scene_workers=2,
+    clip_to_selection=True,
 )
 ```
 
@@ -113,9 +126,9 @@ config = ForcePipelineConfig(
         shadow_buffer=90,
         max_cloud_cover_frame=80,
         max_cloud_cover_tile=60,
-        processes=1,
-        threads=2,
+        scene_workers=2,
     ),
+    clip_to_selection=True,
 )
 
 with ForcePipeline(config) as pipeline:
@@ -164,9 +177,11 @@ paths and source item IDs back into DuckDB.
 
 `OUTPUT_ROOT/level1/queue.txt` is a standard FORCE file queue. A complete
 download is `QUEUED`, a verified L2PS publication is `DONE`, and a processing
-failure is `FAIL`. TerraVault's high-level wrapper processes scenes
-sequentially through the existing isolated per-SAFE processor; the aggregate
-queue also remains usable by external FORCE tooling. The format follows the
+failure is `FAIL`. TerraVault's high-level wrapper hands each complete SAFE to
+up to `scene_workers` isolated per-SAFE processors while downloads continue;
+catalogue writes stay on the calling thread. On interruption, running FORCE
+jobs are cancelled (their containers stopped) and recorded as `interrupted`.
+The aggregate queue also remains usable by external FORCE tooling. The format follows the
 official [FORCE file queue](https://force-eo.readthedocs.io/en/latest/components/lower-level/level1/queue.html)
 contract.
 

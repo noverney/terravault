@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,8 +13,9 @@ import pytest
 
 import terravault.force_pipeline as force_pipeline_module
 from terravault.cli import _default_log_file, build_parser
-from terravault.force_level2 import ForceLevel2Result
+from terravault.force_level2 import ForceLevel2Cancelled, ForceLevel2Result
 from terravault.force_pipeline import (
+    ForceLevel2Options,
     ForcePipeline,
     ForcePipelineConfig,
     ForcePipelineDatabase,
@@ -387,3 +389,195 @@ def test_convenience_api_resolves_cdse_credentials_from_environment(
     assert result.s3.access_key == "access"
     assert result.s3.secret_key == "secret"
     assert result.auth.access_token == "bearer"
+
+
+def _two_items() -> list[pystac.Item]:
+    return [
+        _item(sensing="20260717T103029", production="20260717T142404"),
+        _item(sensing="20260720T102559", production="20260720T123456"),
+    ]
+
+
+def test_scene_workers_process_scenes_concurrently(tmp_path):
+    config = _config(tmp_path)
+    config = ForcePipelineConfig(
+        **{**config.__dict__, "force": ForceLevel2Options(scene_workers=2)}
+    )
+    both_running = threading.Barrier(2, timeout=5)
+    threads: set[str] = set()
+
+    class _ConcurrentProcessor(_Processor):
+        def run(self):
+            threads.add(threading.current_thread().name)
+            both_running.wait()
+            return super().run()
+
+    with ForcePipeline(
+        config,
+        catalog=_Catalog(_two_items()),
+        downloader_factory=_Downloader,
+        processor_factory=_ConcurrentProcessor,
+    ) as pipeline:
+        result = pipeline.run()
+
+    assert result.status == "complete"
+    assert result.processed == 2
+    assert len(threads) == 2
+    with ForcePipelineDatabase(result.database_path) as database:
+        assert {scene["force_status"] for scene in database.scenes()} == {"complete"}
+    assert result.queue_path.read_text(encoding="utf-8").count(" DONE\n") == 2
+
+
+def test_downloads_continue_while_a_scene_is_processed(tmp_path):
+    second_downloaded = threading.Event()
+    processed_before_second_download: list[bool] = []
+
+    class _TrackingDownloader(_Downloader):
+        def run(self):
+            result = super().run()
+            if "20260720" in result.product_name:
+                second_downloaded.set()
+            return result
+
+    class _WaitingProcessor(_Processor):
+        def run(self):
+            if "20260717" in self.config.input_path.name:
+                processed_before_second_download.append(not second_downloaded.wait(5))
+            return super().run()
+
+    with ForcePipeline(
+        _config(tmp_path),
+        catalog=_Catalog(_two_items()),
+        downloader_factory=_TrackingDownloader,
+        processor_factory=_WaitingProcessor,
+    ) as pipeline:
+        result = pipeline.run()
+
+    assert result.status == "complete"
+    assert processed_before_second_download == [False]
+
+
+def test_interruption_cancels_running_force_jobs(tmp_path):
+    first_started = threading.Event()
+    cancelled: list[str] = []
+
+    class _CancellableProcessor(_Processor):
+        def __init__(self, config) -> None:
+            super().__init__(config)
+            self._cancelled = threading.Event()
+
+        def cancel(self) -> None:
+            cancelled.append(self.config.input_path.name)
+            self._cancelled.set()
+
+        def run(self):
+            first_started.set()
+            if not self._cancelled.wait(5):
+                raise AssertionError("pipeline did not cancel the running FORCE job")
+            raise ForceLevel2Cancelled("stopped")
+
+    class _InterruptingDownloader(_Downloader):
+        def run(self):
+            item = json.loads(self.config.item_path.read_text(encoding="utf-8"))
+            if "20260720" in item["id"]:
+                assert first_started.wait(5)
+                raise KeyboardInterrupt("stop")
+            return super().run()
+
+    config = _config(tmp_path)
+    with ForcePipeline(
+        config,
+        catalog=_Catalog(_two_items()),
+        downloader_factory=_InterruptingDownloader,
+        processor_factory=_CancellableProcessor,
+    ) as pipeline:
+        with pytest.raises(KeyboardInterrupt):
+            pipeline.run()
+
+    assert len(cancelled) == 1 and "20260717" in cancelled[0]
+    with ForcePipelineDatabase(config.effective_database_path) as database:
+        scenes = {scene["item_id"]: scene for scene in database.scenes()}
+        run = database.connection.execute(
+            "SELECT status FROM runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
+    first, second = sorted(scenes)
+    assert scenes[first]["force_status"] == "interrupted"
+    assert scenes[second]["download_status"] == "interrupted"
+    assert run[0] == "interrupted"
+
+
+def test_clip_to_selection_passes_a_stable_aoi_to_force(tmp_path):
+    configs = []
+
+    class _RecordingProcessor(_Processor):
+        def __init__(self, config) -> None:
+            super().__init__(config)
+            configs.append(config)
+
+    config = ForcePipelineConfig(**{**_config(tmp_path).__dict__, "clip_to_selection": True})
+    for _ in range(2):
+        with ForcePipeline(
+            config,
+            catalog=_Catalog([_item()]),
+            downloader_factory=_Downloader,
+            processor_factory=_RecordingProcessor,
+        ) as pipeline:
+            assert pipeline.run().status == "complete"
+
+    first, second = configs
+    assert first.aoi_path == second.aoi_path
+    assert first.aoi_path.parent == config.output_root / "_terravault/force-pipeline/aoi"
+    aoi = json.loads(first.aoi_path.read_text(encoding="utf-8"))
+    assert aoi["features"][0]["geometry"]["coordinates"][0][0] == [5.96, 45.82]
+    with pytest.raises(ValueError, match="clip_to_selection"):
+        ForcePipelineConfig(
+            **{
+                **_config(tmp_path).__dict__,
+                "clip_to_selection": True,
+                "force": ForceLevel2Options(aoi_path=tmp_path / "aoi.gpkg"),
+            }
+        )
+
+
+def test_default_threads_are_shared_between_scene_workers(tmp_path, monkeypatch):
+    monkeypatch.setattr("terravault.force_level2.os.cpu_count", lambda: 12)
+    safe = tmp_path / "S2B_MSIL1C_20260717T103029_N0512_R108_T32TMT_20260717T142404.SAFE"
+
+    shared = ForceLevel2Options(scene_workers=4, dry_run=True).config(
+        input_path=safe, output_root=tmp_path
+    )
+    explicit = ForceLevel2Options(scene_workers=4, threads=5, dry_run=True).config(
+        input_path=safe, output_root=tmp_path
+    )
+
+    assert shared.nthread == 3
+    assert explicit.nthread == 5
+    with pytest.raises(ValueError, match="scene_workers"):
+        ForceLevel2Options(scene_workers=0)
+
+
+def test_force_pipeline_cli_scene_workers_and_clip_to_roi(tmp_path):
+    parser = build_parser()
+    base = [
+        "force-pipeline",
+        "--bbox",
+        "5.96",
+        "45.82",
+        "10.49",
+        "47.81",
+        "--start-date",
+        "2026-07-01",
+        "--output-root",
+        str(tmp_path / "force"),
+    ]
+
+    defaults = parser.parse_args(base)
+    args = parser.parse_args([*base, "--scene-workers", "3", "--clip-to-roi"])
+
+    assert defaults.scene_workers == 1
+    assert defaults.threads is None
+    assert defaults.clip_to_roi is False
+    assert args.scene_workers == 3
+    assert args.clip_to_roi is True
+    with pytest.raises(SystemExit):
+        parser.parse_args([*base, "--clip-to-roi", "--force-aoi", "aoi.gpkg"])

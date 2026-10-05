@@ -942,12 +942,14 @@ def cmd_force_pipeline(args: argparse.Namespace) -> int:
                 processes=args.processes,
                 threads=args.threads,
                 parallel_reads=args.parallel_reads,
+                scene_workers=args.scene_workers,
                 output_overview=not args.no_force_overview,
                 overwrite=args.overwrite,
                 retry_failed=args.retry_failed,
                 dry_run=args.dry_run,
                 progress_interval_seconds=args.progress_interval_seconds,
             ),
+            clip_to_selection=args.clip_to_roi,
         )
         with ForcePipeline(config) as pipeline:
             result = pipeline.run(
@@ -2521,11 +2523,21 @@ def build_parser() -> argparse.ArgumentParser:
     force_pipeline_p.add_argument("--origin-lat", type=float, default=48.0, metavar="DEG")
     force_pipeline_p.add_argument("--tile-size", type=int, default=30_000, metavar="UNITS")
     force_pipeline_p.add_argument("--resolution", type=float, default=10, metavar="UNITS")
-    force_pipeline_p.add_argument(
+    force_pipeline_aoi = force_pipeline_p.add_mutually_exclusive_group()
+    force_pipeline_aoi.add_argument(
         "--force-aoi",
         default=None,
         metavar="VECTOR",
         help="Optional FORCE cutline applied after radiometric correction",
+    )
+    force_pipeline_aoi.add_argument(
+        "--clip-to-roi",
+        action="store_true",
+        help=(
+            "Use the --bbox/--roi discovery geometry as the FORCE cutline: tiles outside "
+            "it are not written, and reflectance within ~3 km of its edge differs from "
+            "an unclipped run"
+        ),
     )
     force_pipeline_p.add_argument(
         "--dem",
@@ -2547,8 +2559,33 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PCT",
         help="FORCE post-detection output-tile cloud ceiling (default: 100)",
     )
-    force_pipeline_p.add_argument("--processes", type=int, default=1, metavar="N")
-    force_pipeline_p.add_argument("--threads", type=int, default=2, metavar="N")
+    force_pipeline_p.add_argument(
+        "--scene-workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "SAFE products processed by FORCE at the same time while downloads "
+            "continue (default: 1; one Sentinel-2 scene needs ~8 GiB of container memory)"
+        ),
+    )
+    force_pipeline_p.add_argument(
+        "--processes",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "FORCE NPROC; each FORCE call receives one SAFE, so use --scene-workers "
+            "to process scenes concurrently (default: 1)"
+        ),
+    )
+    force_pipeline_p.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help="OpenMP threads per scene (default: CPU count / --scene-workers)",
+    )
     force_pipeline_p.add_argument("--parallel-reads", action="store_true")
     force_pipeline_p.add_argument("--no-force-overview", action="store_true")
     force_pipeline_p.add_argument("--retry-failed", action="store_true")
@@ -2693,9 +2730,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         metavar="N",
-        help="Concurrent FORCE scene processes (default: 1; one S2 scene needs ~8 GiB)",
+        help=(
+            "FORCE NPROC; this command queues one SAFE, so run separate commands "
+            "(or force-pipeline --scene-workers) to process scenes concurrently"
+        ),
     )
-    force_l2_p.add_argument("--threads", type=int, default=2, metavar="N")
+    force_l2_p.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help="OpenMP threads for the scene (default: CPU count)",
+    )
     force_l2_p.add_argument("--parallel-reads", action="store_true")
     force_l2_p.add_argument("--no-force-overview", action="store_true")
     force_l2_p.add_argument("--retry-failed", action="store_true")

@@ -233,8 +233,8 @@ external-feature bridge:
 | FORCE tile size | 30,000 m (3000 × 3000 pixels) |
 | WGS84 grid origin | 5.5° E, 48.0° N |
 | Resolution merge | `IMPROPHE` |
-| Concurrent scenes | 1 |
-| Threads per scene | 2 |
+| Concurrent scenes | 1 (`force-pipeline --scene-workers`) |
+| Threads per scene | CPU count ÷ concurrent scenes |
 | Cloud/cirrus/shadow/snow buffers | 300 / 0 / 90 / 30 m |
 | Cloud/shadow thresholds | 0.225 / 0.02 |
 | Maximum frame/tile cloud cover | 100% / 100% |
@@ -268,9 +268,16 @@ prevent them from merging or overwriting one another.
 `_terravault/force-l2/cube.json` records the CRS/WKT, grid origin, tile size,
 resolution, and required FORCE version. That definition is immutable for the
 output root—even `--overwrite` cannot change it. Use a new output root for a
-different grid or projection. The global worker lock serializes operations
-sharing the root, and `--processes 1` remains conservative because one
-Sentinel-2 scene can require roughly 8 GiB of memory.
+different grid or projection. A lock per SAFE
+(`_terravault/force-l2/locks/<SAFE-stem>.lock`) rejects a second worker for
+the same product, while different products may be processed at the same time;
+creating `cube.json` is serialized separately. `--processes` is FORCE's
+`NPROC`, which parallelizes queue entries, and TerraVault gives FORCE exactly
+one SAFE per call, so it does not run scenes concurrently. Use
+`force-pipeline --scene-workers N` (or several `force-level2` commands) for
+that, and size `N` by memory: one Sentinel-2 scene can require roughly 8 GiB,
+and Docker Desktop's VM memory limit applies to all containers together.
+`--threads` defaults to the CPU count divided by the scene workers.
 
 A Swiss-wide date requires several products and is not one simultaneous
 exposure. `force-level2` can process those SAFE products one at a time, but it
@@ -504,8 +511,9 @@ This cron entry does not run native L2PS. `terravault force-level2` is only the
 durable one-L1C-product processing primitive. Neither `watch` nor `historic`
 currently discovers L1C items and dispatches FORCE jobs, and no active Swiss
 rolling FORCE scheduler is included yet. A future scheduler may invoke it for
-each saved L1C STAC item, but calls sharing one output root must remain
-serialized by `_terravault/force-l2/worker.lock`.
+each saved L1C STAC item. Calls for different SAFEs may share an output root
+concurrently; `_terravault/force-l2/locks/<SAFE-stem>.lock` serializes calls
+for the same SAFE.
 
 ## State, logs and restart behaviour
 
@@ -577,7 +585,8 @@ FORCE_NATIVE_ROOT/
         ├── logs/SAFE_STEM/...
         ├── provenance/SAFE_STEM/...
         ├── attempts/SAFE_STEM/level2/...  # transient; removed after publish
-        └── worker.lock
+        ├── locks/SAFE_STEM.lock
+        └── cube.lock
 ```
 
 The per-SAFE `*.batch.log` is written continuously while the FORCE child runs,
@@ -619,6 +628,9 @@ queue state `DONE`, non-empty BOA and QAI chips with identical tile coverage,
 the requested CRS, north-up pixel grid, exact tile dimensions/alignment,
 matching OVV coverage and cube-aligned origins when enabled, strict BOA/QAI/OVV
 band metadata, and valid VRTs whose source lists exactly match those chips.
+The GDAL inspection runs as batches of `gdalinfo -json -mdd all` and
+`gdalsrsinfo -o wkt1` commands inside one runtime shell rather than one
+container per raster.
 
 Pixels are first written below
 `_terravault/force-l2/attempts/<SAFE-stem>/level2/`. Only after all checks pass
@@ -628,11 +640,17 @@ damage another SAFE or replace the last verified publication. On retry,
 TerraVault discards only that SAFE's partial attempt and starts its FORCE work
 cleanly; a failed manifest requires `--retry-failed`.
 
-Rerunning an identical complete job skips it. Changed input, DEM/AOI, or
-processing settings require `--overwrite`; replacement is still confined to
-that SAFE. Grid changes are different: `cube.json` rejects them regardless of
-`--overwrite`, so they require a new output root. The lock rejects a second
-worker rather than risking concurrent state writes. `--overwrite` is
+Rerunning an identical complete job skips it. The completed manifest records
+the size and modification time of every published file; while they are
+unchanged a rerun skips without starting FORCE, Docker or GDAL. If any file
+changed, or the manifest predates this record, the publication is re-inspected
+once and the record is written. Changed input, DEM/AOI, or processing settings
+require `--overwrite`; replacement is still confined to that SAFE. `--threads`,
+`--processes` and `--parallel-reads` only change speed: they are recorded in
+the manifest but do not count as changed settings. Grid changes are different:
+`cube.json` rejects them regardless of `--overwrite`, so they require a new
+output root. The per-SAFE lock rejects a second worker for the same product
+rather than risking concurrent state writes. `--overwrite` is
 intentional per-product replacement, not a quota/network retry switch.
 
 Sibling SAFE directories—even when their FORCE filenames share the same date

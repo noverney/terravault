@@ -7,6 +7,8 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -15,8 +17,11 @@ import pytest
 
 from terravault.cli import _default_log_file, build_parser
 from terravault.force_level2 import (
+    ForceLevel2Cancelled,
     ForceLevel2Config,
     ForceLevel2Processor,
+    _RunLock,
+    default_force_threads,
     inspect_force_level2_status,
 )
 
@@ -64,11 +69,86 @@ def _make_safe_zip(tmp_path: Path, *, root: str = PRODUCT_NAME) -> Path:
     return archive_path
 
 
+_FAKE_WKT = 'PROJCS["Swiss",\nUNIT["metre",1]]\n'
+
+
+def _fake_gdalinfo(path: str) -> dict[str, object]:
+    overview = "_OVV." in path
+    metadata: dict[str, object] = {
+        "size": [200, 200] if overview else [3000, 3000],
+        "geoTransform": (
+            [2600000, 150, 0, 1200000, 0, -150]
+            if overview
+            else [2600000, 10, 0, 1200000, 0, -10]
+        ),
+        "coordinateSystem": {"wkt": 'PROJCS["Swiss"]'},
+    }
+    if "_BOA." in path:
+        domains = (
+            "BLUE",
+            "GREEN",
+            "RED",
+            "REDEDGE1",
+            "REDEDGE2",
+            "REDEDGE3",
+            "BROADNIR",
+            "NIR",
+            "SWIR1",
+            "SWIR2",
+        )
+        metadata["bands"] = [
+            {
+                "type": "Int16",
+                "noDataValue": -9999,
+                "description": domain,
+                "metadata": {"FORCE": {"Domain": domain}},
+            }
+            for domain in domains
+        ]
+    elif "_QAI." in path:
+        metadata["bands"] = [
+            {
+                "type": "Int16",
+                "noDataValue": 1,
+                "description": "Quality assurance information",
+                "metadata": {"FORCE": {"Domain": "QAI"}},
+            }
+        ]
+    else:
+        metadata["bands"] = [
+            {
+                "type": "UInt16",
+                "colorInterpretation": color,
+            }
+            for color in ("Red", "Green", "Blue")
+        ]
+        metadata["driverShortName"] = "JPEG"
+    return metadata
+
+
+def _fake_inspection_batch(arguments, metadata_hook=None) -> str:
+    """Emulate the batched ``sh -c`` gdalinfo/gdalsrsinfo inspection output."""
+
+    assert arguments[1] == "-c"
+    marker = arguments[3]
+    lines: list[str] = []
+    for request in arguments[4:]:
+        kind, _, path = request.partition(":")
+        metadata = _fake_gdalinfo(path)
+        if metadata_hook is not None:
+            metadata = metadata_hook(path, metadata)
+        lines.extend(("", f"{marker} INFO {path}", json.dumps(metadata)))
+        if kind == "s":
+            lines.extend(("", f"{marker} SRS {path}", _FAKE_WKT))
+    return "\n".join(lines) + "\n"
+
+
 def _fake_force_runtime(
     processor: ForceLevel2Processor,
     *,
     queue_status: str = "DONE",
     returncode: int = 0,
+    metadata_hook=None,
 ):
     def run(
         arguments: list[str] | tuple[str, ...],
@@ -84,60 +164,9 @@ def _fake_force_runtime(
         if executable == "force-info":
             stdout = "Hello, running FORCE v. 3.10.04\n"
         elif executable == "gdalsrsinfo":
-            stdout = 'PROJCS["Swiss",\nUNIT["metre",1]]\n'
-        elif executable == "gdalinfo":
-            path = str(arguments[-1])
-            overview = "_OVV." in path
-            metadata = {
-                "size": [200, 200] if overview else [3000, 3000],
-                "geoTransform": (
-                    [2600000, 150, 0, 1200000, 0, -150]
-                    if overview
-                    else [2600000, 10, 0, 1200000, 0, -10]
-                ),
-                "coordinateSystem": {"wkt": 'PROJCS["Swiss"]'},
-            }
-            if "_BOA." in path:
-                domains = (
-                    "BLUE",
-                    "GREEN",
-                    "RED",
-                    "REDEDGE1",
-                    "REDEDGE2",
-                    "REDEDGE3",
-                    "BROADNIR",
-                    "NIR",
-                    "SWIR1",
-                    "SWIR2",
-                )
-                metadata["bands"] = [
-                    {
-                        "type": "Int16",
-                        "noDataValue": -9999,
-                        "description": domain,
-                        "metadata": {"FORCE": {"Domain": domain}},
-                    }
-                    for domain in domains
-                ]
-            elif "_QAI." in path:
-                metadata["bands"] = [
-                    {
-                        "type": "Int16",
-                        "noDataValue": 1,
-                        "description": "Quality assurance information",
-                        "metadata": {"FORCE": {"Domain": "QAI"}},
-                    }
-                ]
-            else:
-                metadata["bands"] = [
-                    {
-                        "type": "UInt16",
-                        "colorInterpretation": color,
-                    }
-                    for color in ("Red", "Green", "Blue")
-                ]
-                metadata["driverShortName"] = "JPEG"
-            stdout = json.dumps(metadata)
+            stdout = _FAKE_WKT
+        elif executable == "sh":
+            stdout = _fake_inspection_batch(arguments, metadata_hook)
         elif executable == "force-level2":
             processor.queue_path.write_text(
                 f"{processor.config.input_path} {queue_status}\n",
@@ -352,25 +381,176 @@ def test_force_level2_done_writes_products_parameters_and_skips(tmp_path, monkey
     cube = json.loads(processor.cube_config_path.read_text(encoding="utf-8"))
     assert cube["target_crs"] == "EPSG:2056"
 
+    assert manifest["output_signature"] == processor._output_signature(result.level2_root)
+    assert {entry["path"] for entry in manifest["output_signature"]} >= {
+        f"X0000_Y0000/{processor.product_tag}_BOA.tif",
+        f"mosaic/{processor.product_tag}_QAI.vrt",
+    }
+
     repeated = ForceLevel2Processor(config)
+    repeated_calls: list[str] = []
 
-    validation_runtime = _fake_force_runtime(repeated)
-    validation_calls: list[str] = []
+    def unexpected_run(arguments, **_kwargs):
+        repeated_calls.append(Path(arguments[0]).name)
+        raise AssertionError("unchanged complete publication should skip without commands")
 
-    def validation_run(arguments, **kwargs):
-        executable = Path(arguments[0]).name
-        validation_calls.append(executable)
-        if executable in {"force-level2", "force-mosaic"}:
-            raise AssertionError("unchanged complete job should not reprocess FORCE")
-        return validation_runtime(arguments, **kwargs)
-
-    monkeypatch.setattr(repeated, "_run", validation_run)
+    monkeypatch.setattr(repeated, "_run", unexpected_run)
     repeated_result = repeated.run()
     assert repeated_result.skipped
     assert repeated_result.boa_paths == result.boa_paths
     assert repeated_result.qai_paths == result.qai_paths
-    assert "force-info" in validation_calls
-    assert "gdalinfo" in validation_calls
+    assert repeated_calls == []
+
+
+def test_force_level2_changed_publication_is_revalidated_in_one_batch(tmp_path, monkeypatch):
+    config = ForceLevel2Config(
+        input_path=_make_safe_directory(tmp_path / "input"),
+        output_root=tmp_path / "output",
+        runtime="native",
+    )
+    first = ForceLevel2Processor(config)
+    monkeypatch.setattr(
+        "terravault.force_level2.shutil.which", lambda command: f"/usr/bin/{command}"
+    )
+    monkeypatch.setattr(first, "_run", _fake_force_runtime(first))
+    result = first.run()
+    boa = result.boa_paths[0]
+    stat = boa.stat()
+    os.utime(boa, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+    repeated = ForceLevel2Processor(config)
+    validation_runtime = _fake_force_runtime(repeated)
+    calls: list[str] = []
+
+    def validation_run(arguments, **kwargs):
+        executable = Path(arguments[0]).name
+        calls.append(executable)
+        if executable in {"force-level2", "force-mosaic"}:
+            raise AssertionError("a valid publication must not be reprocessed")
+        return validation_runtime(arguments, **kwargs)
+
+    monkeypatch.setattr(repeated, "_run", validation_run)
+    revalidated = repeated.run()
+
+    assert revalidated.skipped
+    # Version, target CRS, then one batch for the chips and one for the mosaics.
+    assert calls == ["force-info", "gdalsrsinfo", "sh", "sh"]
+    manifest = json.loads(repeated.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["output_signature"] == repeated._output_signature(result.level2_root)
+
+    third = ForceLevel2Processor(config)
+    monkeypatch.setattr(third, "_run", lambda *_args, **_kwargs: pytest.fail("no commands"))
+    assert third.run().skipped
+
+
+def test_force_level2_thread_settings_do_not_invalidate_completed_jobs(tmp_path, monkeypatch):
+    safe = _make_safe_directory(tmp_path / "input")
+    output_root = tmp_path / "output"
+    monkeypatch.setattr(
+        "terravault.force_level2.shutil.which", lambda command: f"/usr/bin/{command}"
+    )
+    first = ForceLevel2Processor(
+        ForceLevel2Config(input_path=safe, output_root=output_root, runtime="native", nthread=2)
+    )
+    monkeypatch.setattr(first, "_run", _fake_force_runtime(first))
+    first.run()
+
+    # Rewrite the manifest as an older TerraVault would have: thread settings in
+    # the fingerprint and no output signature.
+    manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+    input_signature = manifest["input_signature"]
+    auxiliary_signature = manifest["auxiliary_signature"]
+    manifest["fingerprint"] = first._fingerprint(
+        input_signature,
+        auxiliary_signature,
+        performance={"nproc": 1, "nthread": 2, "parallel_reads": False},
+    )
+    del manifest["output_signature"]
+    first.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    retuned = ForceLevel2Processor(
+        ForceLevel2Config(
+            input_path=safe,
+            output_root=output_root,
+            runtime="native",
+            nthread=8,
+            parallel_reads=True,
+        )
+    )
+    validation_runtime = _fake_force_runtime(retuned)
+
+    def validation_run(arguments, **kwargs):
+        if Path(arguments[0]).name in {"force-level2", "force-mosaic"}:
+            raise AssertionError("changing threads must not reprocess a completed SAFE")
+        return validation_runtime(arguments, **kwargs)
+
+    monkeypatch.setattr(retuned, "_run", validation_run)
+    assert retuned.run().skipped
+    upgraded = json.loads(retuned.manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["fingerprint"] == retuned._fingerprint(input_signature, auxiliary_signature)
+    assert upgraded["settings"]["nthread"] == 2
+    assert upgraded["output_signature"]
+
+    changed = ForceLevel2Processor(
+        ForceLevel2Config(
+            input_path=safe,
+            output_root=output_root,
+            runtime="native",
+            cloud_buffer=150,
+        )
+    )
+    monkeypatch.setattr(changed, "_run", _fake_force_runtime(changed))
+    with pytest.raises(FileExistsError, match="settings or input changed"):
+        changed.run()
+
+
+def test_force_level2_inspection_script_batches_gdal_in_one_shell(tmp_path, monkeypatch):
+    bin_root = tmp_path / "bin"
+    bin_root.mkdir()
+    calls = tmp_path / "calls.txt"
+    (bin_root / "gdalinfo").write_text(
+        "#!/bin/sh\n"
+        f'echo "gdalinfo $*" >> "{calls}"\n'
+        'case "$4" in *broken*) echo partial; exit 1;; esac\n'
+        'printf \'{\\n  "path": "%s"\\n}\' "$4"\n',
+        encoding="utf-8",
+    )
+    (bin_root / "gdalsrsinfo").write_text(
+        "#!/bin/sh\n"
+        f'echo "gdalsrsinfo $*" >> "{calls}"\n'
+        "printf 'PROJCS[\"Swiss\",\\n    UNIT[\"metre\",1]]\\n'\n",
+        encoding="utf-8",
+    )
+    for executable in bin_root.iterdir():
+        executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_root}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(
+        "terravault.force_level2.shutil.which", lambda command: f"/usr/bin/{command}"
+    )
+    processor = ForceLevel2Processor(
+        ForceLevel2Config(
+            input_path=_make_safe_directory(tmp_path / "input"),
+            output_root=tmp_path / "output",
+            runtime="native",
+        )
+    )
+    chip = tmp_path / "X0000_Y0000" / "BOA.tif"
+    overview = tmp_path / "X0000_Y0000" / "OVV.jpg"
+
+    inspections = processor._inspect_force_rasters([(chip, True), (overview, False)])
+
+    assert inspections[chip]["metadata"] == {"path": str(chip)}
+    assert inspections[chip]["projection_wkt"] == 'PROJCS["Swiss", UNIT["metre",1]]'
+    assert inspections[overview] == {"metadata": {"path": str(overview)}, "projection_wkt": None}
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        f"gdalinfo -json -mdd all {chip}",
+        f"gdalsrsinfo -o wkt1 {chip}",
+        f"gdalinfo -json -mdd all {overview}",
+    ]
+    assert [command[0] for command in processor._commands] == ["sh"]
+
+    with pytest.raises(RuntimeError, match="GDAL could not inspect FORCE output: .*broken"):
+        processor._inspect_force_rasters([(tmp_path / "broken.tif", False), (chip, True)])
 
 
 def test_force_level2_accepts_force_six_decimal_origin_serialization(tmp_path, monkeypatch):
@@ -533,25 +713,20 @@ def test_force_level2_rejects_invalid_overview_contract(
     monkeypatch.setattr(
         "terravault.force_level2.shutil.which", lambda command: f"/usr/bin/{command}"
     )
-    fake_runtime = _fake_force_runtime(processor)
-
-    def invalid_overview(arguments, **kwargs):
-        completed = fake_runtime(arguments, **kwargs)
-        if Path(arguments[0]).name != "gdalinfo" or "_OVV." not in str(arguments[-1]):
-            return completed
-        metadata = json.loads(completed.stdout)
+    def invalid_overview(path, metadata):
+        if "_OVV." not in path:
+            return metadata
         if failure == "metadata":
             metadata["bands"][0]["colorInterpretation"] = "Undefined"
         else:
             metadata["size"][0] += 1
-        return subprocess.CompletedProcess(
-            completed.args,
-            completed.returncode,
-            json.dumps(metadata),
-            completed.stderr,
-        )
+        return metadata
 
-    monkeypatch.setattr(processor, "_run", invalid_overview)
+    monkeypatch.setattr(
+        processor,
+        "_run",
+        _fake_force_runtime(processor, metadata_hook=invalid_overview),
+    )
 
     with pytest.raises(RuntimeError, match=message):
         processor.run()
@@ -684,3 +859,118 @@ def test_force_level2_cli_parser_and_default_log(tmp_path):
     assert args.download_retry_base_seconds == 2.0
     assert args.download_quota_wait_seconds == 900.0
     assert _default_log_file(args) == (output_root / "_terravault/logs/force-level2.log")
+
+
+def test_force_level2_default_threads_share_host_cpus(tmp_path, monkeypatch):
+    monkeypatch.setattr("terravault.force_level2.os.cpu_count", lambda: 12)
+
+    config = ForceLevel2Config(
+        input_path=_make_safe_directory(tmp_path / "input"),
+        output_root=tmp_path / "output",
+        dry_run=True,
+    )
+
+    assert config.nthread == 12
+    assert default_force_threads(4) == 3
+    assert default_force_threads(24) == 1
+    with pytest.raises(ValueError, match="scene_workers"):
+        default_force_threads(0)
+
+
+def test_force_level2_locks_each_safe_separately(tmp_path):
+    output_root = tmp_path / "output"
+    first = ForceLevel2Processor(
+        ForceLevel2Config(
+            input_path=_make_safe_directory(tmp_path / "first"),
+            output_root=output_root,
+            dry_run=True,
+        )
+    )
+    second_name = PRODUCT_NAME.replace("20260717T142404", "20260717T155959")
+    second = ForceLevel2Processor(
+        ForceLevel2Config(
+            input_path=_make_safe_directory(tmp_path / "second", product_name=second_name),
+            output_root=output_root,
+            dry_run=True,
+        )
+    )
+    same_as_first = ForceLevel2Processor(first.config)
+
+    with _RunLock(first.lock_path), _RunLock(second.lock_path):
+        with pytest.raises(RuntimeError, match="Another FORCE L2PS worker holds"):
+            with _RunLock(same_as_first.lock_path):
+                pass
+
+
+def test_force_level2_cancel_terminates_the_running_command(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "terravault.force_level2.shutil.which", lambda command: f"/usr/bin/{command}"
+    )
+    processor = ForceLevel2Processor(
+        ForceLevel2Config(
+            input_path=_make_safe_directory(tmp_path / "input"),
+            output_root=tmp_path / "output",
+            runtime="native",
+        )
+    )
+    outcome: list[BaseException] = []
+
+    def execute() -> None:
+        try:
+            processor._execute_force(sys.executable, ["-c", "import time; time.sleep(30)"])
+        except BaseException as exc:  # noqa: BLE001
+            outcome.append(exc)
+
+    worker = threading.Thread(target=execute)
+    started = time.monotonic()
+    worker.start()
+    time.sleep(0.3)
+    processor.cancel()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 5
+    assert len(outcome) == 1 and isinstance(outcome[0], ForceLevel2Cancelled)
+    with pytest.raises(ForceLevel2Cancelled):
+        processor._execute_force("force-info", [])
+
+
+def test_force_level2_cancelled_job_is_recorded_as_interrupted(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "terravault.force_level2.shutil.which", lambda command: f"/usr/bin/{command}"
+    )
+    processor = ForceLevel2Processor(
+        ForceLevel2Config(
+            input_path=_make_safe_directory(tmp_path / "input"),
+            output_root=tmp_path / "output",
+            runtime="native",
+        )
+    )
+    fake_runtime = _fake_force_runtime(processor, queue_status="QUEUED", returncode=143)
+    force_started = threading.Event()
+
+    def cancellable_run(arguments, **kwargs):
+        if Path(arguments[0]).name == "force-level2":
+            force_started.set()
+            assert processor._cancelled.wait(5)
+        return fake_runtime(arguments, **kwargs)
+
+    monkeypatch.setattr(processor, "_run", cancellable_run)
+    outcome: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            processor.run()
+        except BaseException as exc:  # noqa: BLE001
+            outcome.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert force_started.wait(5)
+    processor.cancel()
+    worker.join(timeout=10)
+
+    assert isinstance(outcome[0], ForceLevel2Cancelled)
+    manifest = json.loads(processor.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "interrupted"
+    assert manifest["output_signature"] is None

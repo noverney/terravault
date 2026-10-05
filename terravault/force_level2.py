@@ -60,6 +60,42 @@ _L1C_BANDS = {
 }
 _L1C_BAND_NAME = re.compile(r"_(B(?:0[1-9]|1[0-2]|8A))\.jp2$")
 _TILE_NAME = re.compile(r"^X(?P<x>-?\d+)_Y(?P<y>-?\d+)$")
+# Scheduling knobs that change speed but not the requested FORCE products. They
+# are recorded in manifests but kept out of the job fingerprint.
+_PERFORMANCE_SETTINGS = ("nproc", "nthread", "parallel_reads")
+_INSPECTION_BATCH_SIZE = 100
+# One runtime shell inspects many rasters with the unchanged GDAL commands.
+# ``$0`` is a per-call marker; each request is ``i:PATH`` (gdalinfo only) or
+# ``s:PATH`` (gdalinfo and gdalsrsinfo).
+_INSPECTION_SCRIPT = """
+for request do
+  path=${request#?:}
+  printf '\\n%s INFO %s\\n' "$0" "$path"
+  gdalinfo -json -mdd all "$path" || printf '\\n%s ERROR %s\\n' "$0" "$path"
+  case $request in
+    s:*)
+      printf '\\n%s SRS %s\\n' "$0" "$path"
+      gdalsrsinfo -o wkt1 "$path" || printf '\\n%s ERROR %s\\n' "$0" "$path"
+      ;;
+  esac
+done
+"""
+_CANCEL_POLL_SECONDS = 0.5
+# Cancel events of jobs whose worker thread is inside ``_run``, by thread id.
+_CANCEL_EVENTS: dict[int, threading.Event] = {}
+_CANCEL_EVENTS_LOCK = threading.Lock()
+
+
+class ForceLevel2Cancelled(RuntimeError):
+    """Raised inside a FORCE job after :meth:`ForceLevel2Processor.cancel`."""
+
+
+def default_force_threads(scene_workers: int = 1) -> int:
+    """Share the host CPUs between concurrently processed scenes."""
+
+    if scene_workers < 1:
+        raise ValueError("scene_workers must be at least 1")
+    return max(1, (os.cpu_count() or 1) // scene_workers)
 
 
 def _absolute(path: str | Path) -> Path:
@@ -101,7 +137,7 @@ class ForceLevel2Config:
     max_cloud_cover_tile: int = 100
     resolution_merge: str = "IMPROPHE"
     nproc: int = 1
-    nthread: int = 2
+    nthread: int | None = None
     parallel_reads: bool = False
     output_overview: bool = True
     overwrite: bool = False
@@ -152,6 +188,8 @@ class ForceLevel2Config:
         if merge not in _RESOLUTION_MERGES:
             raise ValueError("resolution_merge must be IMPROPHE, REGRESSION, STARFM or NONE")
         object.__setattr__(self, "resolution_merge", merge)
+        if self.nthread is None:
+            object.__setattr__(self, "nthread", default_force_threads())
         if self.nproc < 1 or self.nthread < 1:
             raise ValueError("nproc and nthread must be at least 1")
         if self.progress_interval_seconds < 1:
@@ -335,15 +373,17 @@ def inspect_force_level2_status(
 
 
 class _RunLock:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, blocking: bool = False) -> None:
         self.path = path
+        self.blocking = blocking
         self.stream: Any | None = None
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.stream = self.path.open("a+", encoding="utf-8")
+        operation = fcntl.LOCK_EX if self.blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
         try:
-            fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(self.stream.fileno(), operation)
         except BlockingIOError as exc:
             self.stream.close()
             raise RuntimeError(f"Another FORCE L2PS worker holds {self.path}") from exc
@@ -398,7 +438,10 @@ class ForceLevel2Processor:
         self.progress_path = self.progress_root / f"{self.job_stem}.json"
         self.container_cid_path = self.container_root / f"{self.job_stem}.cid"
         self.batch_log_path = self.log_root / f"{self.job_stem}.batch.log"
-        self.lock_path = self.state_root / "worker.lock"
+        # Each SAFE has isolated FORCE state, so different SAFEs may run at once.
+        self.lock_path = self.state_root / "locks" / f"{self.job_stem}.lock"
+        self.cube_lock_path = self.state_root / "cube.lock"
+        self._cancelled = threading.Event()
 
     def _product_identity(self) -> tuple[str, str, dict[str, str]]:
         name = self.config.input_path.name
@@ -451,12 +494,21 @@ class ForceLevel2Processor:
             if log_stream is not None:
                 log_stream.close()
             raise
+        with _CANCEL_EVENTS_LOCK:
+            cancel_event = _CANCEL_EVENTS.get(threading.get_ident())
+        timeout = None if cancel_event is None else _CANCEL_POLL_SECONDS
         try:
-            if log_stream is None:
-                stdout, stderr = process.communicate()
-            else:
-                process.wait()
-                stdout, stderr = "", ""
+            while True:
+                try:
+                    if log_stream is None:
+                        stdout, stderr = process.communicate(timeout=timeout)
+                    else:
+                        process.wait(timeout=timeout)
+                        stdout, stderr = "", ""
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ForceLevel2Cancelled("FORCE command was cancelled") from None
         except BaseException as exc:
             if process.poll() is None:
                 try:
@@ -565,6 +617,24 @@ class ForceLevel2Processor:
         else:
             cid_path.unlink(missing_ok=True)
 
+    def cancel(self) -> None:
+        """Ask a job running on another thread to stop; it ends as ``interrupted``.
+
+        The worker thread notices within ``_CANCEL_POLL_SECONDS``, terminates the
+        running command (stopping its container) and starts no further command.
+        """
+
+        self._cancelled.set()
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancelled.is_set():
+            raise ForceLevel2Cancelled(f"FORCE job was cancelled: {self.product_name}")
+
+    def _is_interruption(self, exc: BaseException) -> bool:
+        return self._cancelled.is_set() or isinstance(
+            exc, (KeyboardInterrupt, SystemExit, ForceLevel2Cancelled)
+        )
+
     def _select_runtime(self) -> str:
         if self._runtime is not None:
             return self._runtime
@@ -671,6 +741,7 @@ class ForceLevel2Processor:
         check: bool = True,
         log_path: Path | None = None,
     ) -> subprocess.CompletedProcess[str] | None:
+        self._raise_if_cancelled()
         track_container = (
             not self.config.dry_run
             and self._select_runtime() == "docker"
@@ -682,15 +753,33 @@ class ForceLevel2Processor:
             track_container=track_container,
         )
         self._commands.append(tuple(command))
-        logger.info("FORCE native Level-2 step – executable=%s", executable)
+        logger.info(
+            "FORCE native Level-2 step – product=%s executable=%s",
+            self.job_stem,
+            executable,
+        )
         if self.config.dry_run:
             return None
-        return self._run(
-            command,
-            check=check,
-            log_path=log_path,
-            container_cid_path=self.container_cid_path if track_container else None,
-        )
+        thread_ident = threading.get_ident()
+        with _CANCEL_EVENTS_LOCK:
+            _CANCEL_EVENTS[thread_ident] = self._cancelled
+        try:
+            completed = self._run(
+                command,
+                check=check,
+                log_path=log_path,
+                container_cid_path=self.container_cid_path if track_container else None,
+            )
+        except Exception:
+            # A command killed by cancellation can also fail its exit-code check.
+            self._raise_if_cancelled()
+            raise
+        finally:
+            with _CANCEL_EVENTS_LOCK:
+                if _CANCEL_EVENTS.get(thread_ident) is self._cancelled:
+                    del _CANCEL_EVENTS[thread_ident]
+        self._raise_if_cancelled()
+        return completed
 
     def _validate_input(self) -> None:
         path = self.config.input_path
@@ -779,18 +868,6 @@ class ForceLevel2Processor:
         wkt = " ".join(completed.stdout.split())
         if not wkt:
             raise RuntimeError(f"Could not resolve target CRS {self.config.target_crs}")
-        return wkt
-
-    def _raster_projection_wkt(self, path: Path) -> str:
-        command = self._force_command(
-            "gdalsrsinfo",
-            ["-o", "wkt1", self._runtime_path(path)],
-        )
-        self._commands.append(tuple(command))
-        completed = self._run(command)
-        wkt = " ".join(completed.stdout.split())
-        if not wkt:
-            raise RuntimeError(f"Could not resolve the output CRS for {path}")
         return wkt
 
     @staticmethod
@@ -1000,18 +1077,51 @@ class ForceLevel2Processor:
         self,
         input_signature: list[dict[str, Any]],
         auxiliary_signature: list[dict[str, Any]],
+        *,
+        performance: dict[str, Any] | None = None,
     ) -> str:
+        """Hash the job identity; ``performance`` reproduces pre-exclusion fingerprints."""
+
+        settings = {
+            key: value
+            for key, value in self._settings().items()
+            if key not in _PERFORMANCE_SETTINGS
+        }
+        if performance is not None:
+            settings.update(performance)
         return hashlib.sha256(
             json.dumps(
                 {
                     "input": input_signature,
                     "auxiliary": auxiliary_signature,
-                    "settings": self._settings(),
+                    "settings": settings,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+
+    def _fingerprint_matches(
+        self,
+        existing: dict[str, Any] | None,
+        fingerprint: str,
+        input_signature: list[dict[str, Any]],
+        auxiliary_signature: list[dict[str, Any]],
+    ) -> bool:
+        if not existing or existing.get("fingerprint") is None:
+            return False
+        if existing["fingerprint"] == fingerprint:
+            return True
+        # Manifests written before thread/process settings left the fingerprint
+        # hashed the values they were processed with.
+        recorded = existing.get("settings") or {}
+        if not all(key in recorded for key in _PERFORMANCE_SETTINGS):
+            return False
+        return existing["fingerprint"] == self._fingerprint(
+            input_signature,
+            auxiliary_signature,
+            performance={key: recorded[key] for key in _PERFORMANCE_SETTINGS},
+        )
 
     def _products(
         self,
@@ -1037,16 +1147,65 @@ class ForceLevel2Processor:
             )
         )
 
-    def _inspect_force_raster(self, path: Path) -> dict[str, Any]:
-        completed = self._execute_force(
-            "gdalinfo",
-            ["-json", "-mdd", "all", self._runtime_path(path)],
-        )
-        assert completed is not None
-        try:
-            return json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"GDAL could not inspect FORCE output: {path}") from exc
+    def _inspect_force_rasters(
+        self,
+        requests: Sequence[tuple[Path, bool]],
+    ) -> dict[Path, dict[str, Any]]:
+        """Return ``gdalinfo -json -mdd all`` metadata for many rasters at once.
+
+        Each request is ``(path, with_projection)``; with a projection the result
+        also holds ``gdalsrsinfo -o wkt1`` output. A separate container per GDAL
+        command used to dominate validation, so one runtime shell runs a batch.
+        """
+
+        inspections: dict[Path, dict[str, Any]] = {}
+        for start in range(0, len(requests), _INSPECTION_BATCH_SIZE):
+            batch = requests[start : start + _INSPECTION_BATCH_SIZE]
+            marker = f"@@terravault-{uuid.uuid4().hex}"
+            completed = self._execute_force(
+                "sh",
+                [
+                    "-c",
+                    _INSPECTION_SCRIPT,
+                    marker,
+                    *(
+                        f"{'s' if with_projection else 'i'}:{self._runtime_path(path)}"
+                        for path, with_projection in batch
+                    ),
+                ],
+            )
+            assert completed is not None
+            sections: dict[tuple[str, str], list[str]] = {}
+            failed: set[str] = set()
+            current: list[str] | None = None
+            for line in completed.stdout.splitlines():
+                if line.startswith(f"{marker} "):
+                    kind, _, runtime_path = line[len(marker) + 1 :].partition(" ")
+                    if kind == "ERROR":
+                        failed.add(runtime_path)
+                        current = None
+                    else:
+                        current = sections.setdefault((kind, runtime_path), [])
+                elif current is not None:
+                    current.append(line)
+            for path, with_projection in batch:
+                runtime_path = self._runtime_path(path)
+                info = sections.get(("INFO", runtime_path))
+                if info is None or runtime_path in failed:
+                    raise RuntimeError(f"GDAL could not inspect FORCE output: {path}")
+                try:
+                    metadata = json.loads("\n".join(info))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"GDAL could not inspect FORCE output: {path}") from exc
+                projection_wkt = None
+                if with_projection:
+                    projection_wkt = " ".join(
+                        "\n".join(sections.get(("SRS", runtime_path), [])).split()
+                    )
+                    if not projection_wkt:
+                        raise RuntimeError(f"Could not resolve the output CRS for {path}")
+                inspections[path] = {"metadata": metadata, "projection_wkt": projection_wkt}
+        return inspections
 
     @staticmethod
     def _force_domain(band: dict[str, Any]) -> str | None:
@@ -1059,10 +1218,11 @@ class ForceLevel2Processor:
         self,
         path: Path,
         suffix: str,
+        inspection: dict[str, Any],
         *,
         chip: bool = False,
     ) -> dict[str, Any]:
-        metadata = self._inspect_force_raster(path)
+        metadata = inspection["metadata"]
         bands = metadata.get("bands") or []
         if suffix == "BOA":
             expected_domains = (
@@ -1137,7 +1297,7 @@ class ForceLevel2Processor:
             raise RuntimeError(f"FORCE {suffix} georeferencing is incomplete: {path}")
         if self._expected_projection_wkt is None:
             raise RuntimeError("Expected FORCE output projection was not initialized")
-        if self._normalized_wkt(self._raster_projection_wkt(path)) != self._normalized_wkt(
+        if self._normalized_wkt(inspection["projection_wkt"] or "") != self._normalized_wkt(
             self._expected_projection_wkt
         ):
             raise RuntimeError(f"FORCE {suffix} CRS does not match the requested cube: {path}")
@@ -1206,7 +1366,15 @@ class ForceLevel2Processor:
             raise RuntimeError(f"FORCE data-cube origin or tile size is invalid: {path}")
         return {"path": path, **numeric}
 
-    def _verify_mosaic(self, suffix: str, *, root: Path) -> Path:
+    def _verify_mosaics(self, *, root: Path) -> None:
+        paths = {
+            suffix: self._verify_mosaic_sources(suffix, root=root) for suffix in ("BOA", "QAI")
+        }
+        inspections = self._inspect_force_rasters([(path, True) for path in paths.values()])
+        for suffix, path in paths.items():
+            self._validate_force_raster(path, suffix, inspections[path])
+
+    def _verify_mosaic_sources(self, suffix: str, *, root: Path) -> Path:
         path = self._mosaic(suffix, root=root)
         if path is None:
             raise RuntimeError(f"FORCE did not create the {suffix} mosaic")
@@ -1228,7 +1396,6 @@ class ForceLevel2Processor:
                 f"FORCE {suffix} mosaic sources do not match the complete chip set "
                 f"(expected={len(expected)}, found={len(sources)}): {path}"
             )
-        self._validate_force_raster(path, suffix)
         return path
 
     def _sanitize_mosaic_xml(self, *, root: Path) -> None:
@@ -1268,18 +1435,36 @@ class ForceLevel2Processor:
             raise RuntimeError("FORCE BOA and QAI tile coverage does not match")
         boa_by_tile = {path.parent.name: path for path in boa}
         qai_by_tile = {path.parent.name: path for path in qai}
+        overviews: tuple[Path, ...] = ()
+        if self.config.output_overview:
+            overviews = self._overviews(root=root)
+            if not overviews or any(path.stat().st_size <= 0 for path in overviews):
+                raise RuntimeError("Expected FORCE OVV quicklooks are missing or empty")
+            overview_tiles = {path.parent.name for path in overviews}
+            if overview_tiles != boa_tiles:
+                raise RuntimeError("FORCE BOA/QAI/OVV tile coverage does not match")
+        for tile in sorted(boa_tiles | {path.parent.name for path in overviews}):
+            if _TILE_NAME.fullmatch(tile) is None:
+                raise RuntimeError(f"Invalid FORCE tile directory: {tile}")
+        inspections = self._inspect_force_rasters(
+            [
+                *((path, True) for path in (*boa, *qai)),
+                *((path, False) for path in overviews),
+            ]
+        )
         for tile in sorted(boa_tiles):
             tile_match = _TILE_NAME.fullmatch(tile)
-            if tile_match is None:
-                raise RuntimeError(f"Invalid FORCE tile directory: {tile}")
+            assert tile_match is not None
             boa_metadata = self._validate_force_raster(
                 boa_by_tile[tile],
                 "BOA",
+                inspections[boa_by_tile[tile]],
                 chip=True,
             )
             qai_metadata = self._validate_force_raster(
                 qai_by_tile[tile],
                 "QAI",
+                inspections[qai_by_tile[tile]],
                 chip=True,
             )
             for key in ("size", "geoTransform", "coordinateSystem"):
@@ -1293,27 +1478,38 @@ class ForceLevel2Processor:
                 and math.isclose(float(transform[3]), expected_y, abs_tol=1e-6)
             ):
                 raise RuntimeError(f"FORCE chip is not aligned to cube tile {tile}")
-        if self.config.output_overview:
-            overviews = self._overviews(root=root)
-            if not overviews or any(path.stat().st_size <= 0 for path in overviews):
-                raise RuntimeError("Expected FORCE OVV quicklooks are missing or empty")
-            overview_tiles = {path.parent.name for path in overviews}
-            if overview_tiles != boa_tiles:
-                raise RuntimeError("FORCE BOA/QAI/OVV tile coverage does not match")
-            for overview in overviews:
-                tile = overview.parent.name
-                if _TILE_NAME.fullmatch(tile) is None:
-                    raise RuntimeError(f"Invalid FORCE tile directory: {tile}")
-                self._validate_force_raster(overview, "OVV", chip=True)
+        for overview in overviews:
+            self._validate_force_raster(overview, "OVV", inspections[overview], chip=True)
 
     def _outputs_complete(self, *, root: Path) -> bool:
         try:
             self._verify_product_files(root=root)
-            self._verify_mosaic("BOA", root=root)
-            self._verify_mosaic("QAI", root=root)
+            self._verify_mosaics(root=root)
+        except ForceLevel2Cancelled:
+            raise
         except (OSError, RuntimeError, ValueError):
             return False
         return True
+
+    @staticmethod
+    def _output_signature(root: Path) -> list[dict[str, Any]]:
+        """Identify every published file cheaply, to skip re-inspecting it with GDAL."""
+
+        if not root.is_dir():
+            return []
+        signature = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            signature.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+            )
+        return signature
 
     def _prepare_attempt(self) -> None:
         """Discard any partial merge before safely retrying this SAFE."""
@@ -1394,6 +1590,9 @@ class ForceLevel2Processor:
         queue_status: str | None,
         error: str | None = None,
     ) -> dict[str, Any]:
+        output_signature = (
+            self._output_signature(self.level2_root) if status == "complete" else None
+        )
         return {
             "schema_version": 1,
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1429,6 +1628,7 @@ class ForceLevel2Processor:
             "overview_paths": [str(path) for path in self._overviews()],
             "boa_mosaic_path": None if self._mosaic("BOA") is None else str(self._mosaic("BOA")),
             "qai_mosaic_path": None if self._mosaic("QAI") is None else str(self._mosaic("QAI")),
+            "output_signature": output_signature,
             "commands": [list(command) for command in self._commands],
         }
 
@@ -1552,9 +1752,7 @@ class ForceLevel2Processor:
                             "schema_version": 1,
                             "updated_at": datetime.now(timezone.utc).isoformat(),
                             "status": (
-                                "interrupted"
-                                if isinstance(exc, (KeyboardInterrupt, SystemExit))
-                                else "failed"
+                                "interrupted" if self._is_interruption(exc) else "failed"
                             ),
                             "phase": "preflight",
                             "error": str(exc),
@@ -1575,6 +1773,33 @@ class ForceLevel2Processor:
                     logger.exception("Could not persist FORCE preflight failure metadata")
             raise
 
+    def _check_existing_manifest(
+        self,
+        existing: dict[str, Any] | None,
+        fingerprint: str,
+        input_signature: list[dict[str, Any]],
+        auxiliary_signature: list[dict[str, Any]],
+    ) -> bool:
+        """Reject blocked reruns; return whether the manifest is for this same job."""
+
+        if existing and existing.get("status") == "failed" and not self.config.retry_failed:
+            raise RuntimeError(
+                f"FORCE L2PS job is failed in {self.manifest_path}; pass --retry-failed"
+            )
+        same_job = self._fingerprint_matches(
+            existing, fingerprint, input_signature, auxiliary_signature
+        )
+        if (
+            existing
+            and existing.get("fingerprint") is not None
+            and not same_job
+            and not self.config.overwrite
+        ):
+            raise FileExistsError(
+                "FORCE L2PS settings or input changed; pass --overwrite or use a new output root"
+            )
+        return same_job
+
     def _run_impl(self) -> ForceLevel2Result:
         """Process or safely reuse one complete L1C observation."""
 
@@ -1583,26 +1808,14 @@ class ForceLevel2Processor:
         input_signature = self._input_signature()
         auxiliary_signature = self._auxiliary_signature()
         fingerprint = self._fingerprint(input_signature, auxiliary_signature)
-        existing = self._existing_manifest()
-        if existing and existing.get("status") == "failed" and not self.config.retry_failed:
-            raise RuntimeError(
-                f"FORCE L2PS job is failed in {self.manifest_path}; pass --retry-failed"
-            )
-        if (
-            existing
-            and existing.get("fingerprint") not in {None, fingerprint}
-            and not self.config.overwrite
-        ):
-            raise FileExistsError(
-                "FORCE L2PS settings or input changed; pass --overwrite or use a new output root"
-            )
+        self._check_existing_manifest(
+            self._existing_manifest(), fingerprint, input_signature, auxiliary_signature
+        )
 
-        self._verify_force_version()
-        projection_wkt = self._projection_wkt()
-        self._expected_projection_wkt = projection_wkt
-        parameter_text = self._parameter_text(projection_wkt)
-        runtime_input = self._runtime_path(self.config.input_path)
         if self.config.dry_run:
+            self._verify_force_version()
+            projection_wkt = self._projection_wkt()
+            self._expected_projection_wkt = projection_wkt
             self._execute_force("force-level2", [self._runtime_path(self.parameter_path)])
             self._execute_force(
                 "force-mosaic",
@@ -1630,23 +1843,30 @@ class ForceLevel2Processor:
         with _RunLock(self.lock_path):
             self._recover_publication()
             existing = self._existing_manifest()
-            if existing and existing.get("status") == "failed" and not self.config.retry_failed:
-                raise RuntimeError(
-                    f"FORCE L2PS job is failed in {self.manifest_path}; pass --retry-failed"
-                )
+            same_job = self._check_existing_manifest(
+                existing, fingerprint, input_signature, auxiliary_signature
+            )
             if (
-                existing
-                and existing.get("fingerprint") not in {None, fingerprint}
+                same_job
                 and not self.config.overwrite
+                and existing.get("status") == "complete"
+                and existing.get("output_signature")
+                and existing["output_signature"] == self._output_signature(self.level2_root)
             ):
-                raise FileExistsError(
-                    "FORCE L2PS settings or input changed; pass --overwrite or use a new "
-                    "output root"
-                )
-            self._ensure_cube_invariant(projection_wkt)
+                # Every published file is byte-for-byte where the completed job
+                # left it, so GDAL re-inspection cannot change the outcome.
+                logger.info("FORCE L2PS job already complete; skipping %s", self.product_name)
+                return self._result(status="complete", skipped=True)
+
+            self._verify_force_version()
+            projection_wkt = self._projection_wkt()
+            self._expected_projection_wkt = projection_wkt
+            parameter_text = self._parameter_text(projection_wkt)
+            runtime_input = self._runtime_path(self.config.input_path)
+            with _RunLock(self.cube_lock_path, blocking=True):
+                self._ensure_cube_invariant(projection_wkt)
             if (
-                existing
-                and existing.get("fingerprint") == fingerprint
+                same_job
                 and not self.config.overwrite
                 and self._outputs_complete(root=self.level2_root)
             ):
@@ -1669,12 +1889,22 @@ class ForceLevel2Processor:
                         ),
                     )
                     self._write_progress(phase="complete", status="complete")
+                else:
+                    # Record the verified publication so the next rerun skips GDAL.
+                    _write_json_atomic(
+                        self.manifest_path,
+                        {
+                            **existing,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "fingerprint": fingerprint,
+                            "output_signature": self._output_signature(self.level2_root),
+                        },
+                    )
                 logger.info("FORCE L2PS job already complete; skipping %s", self.product_name)
                 return self._result(status="complete", skipped=True)
             resume_completed_attempt = False
             if (
-                existing
-                and existing.get("fingerprint") == fingerprint
+                same_job
                 and self.attempt_level2_root.is_dir()
                 and self.queue_path.is_file()
             ):
@@ -1738,13 +1968,10 @@ class ForceLevel2Processor:
                     ],
                 )
                 self._sanitize_mosaic_xml(root=self.attempt_level2_root)
-                self._verify_mosaic("BOA", root=self.attempt_level2_root)
-                self._verify_mosaic("QAI", root=self.attempt_level2_root)
+                self._verify_mosaics(root=self.attempt_level2_root)
                 self._publish_attempt()
             except BaseException as exc:
-                status = (
-                    "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
-                )
+                status = "interrupted" if self._is_interruption(exc) else "failed"
                 queue_status = None
                 if self.queue_path.is_file():
                     try:
