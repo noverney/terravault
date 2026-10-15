@@ -283,14 +283,24 @@ class SwissEOClient:
             raise ValueError(f"swissEO item {item.get('id')} metadata asset has no href")
         return self._json(href)
 
-    def search_month(self, *, year: int, month: int) -> tuple[dict[str, Any], ...]:
+    def search_month(
+        self,
+        *,
+        year: int,
+        month: int,
+        bbox: Sequence[float] | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Items of one month; with ``bbox``, only orbits whose footprint meets it."""
+
         start, end = calendar_month_window(year, month)
         encoded_collection = quote(self.collection, safe="")
         url = f"{self.stac_url}/collections/{encoded_collection}/items"
-        params: Mapping[str, Any] | None = {
+        params: dict[str, Any] | None = {
             "datetime": f"{_iso_z(start)}/{_iso_z(end - timedelta(seconds=1))}",
             "limit": 100,
         }
+        if bbox is not None:
+            params["bbox"] = ",".join(repr(float(value)) for value in bbox)
         items: list[dict[str, Any]] = []
         while url:
             payload = self._json(url, params=params)
@@ -353,14 +363,24 @@ def discover_swisseo_month(
     year: int,
     month: int,
     client: SwissEOClient | None = None,
+    bbox: Sequence[float] | None = None,
 ) -> SwissEODiscoveryResult:
-    """List public swissEO orbit mosaics; no token is required."""
+    """List public swissEO orbit mosaics; no token is required.
+
+    Each item is one orbital track, so a small ``bbox`` keeps only the tracks
+    that actually pass over it.
+    """
 
     active_client = client or SwissEOClient()
+    items = (
+        active_client.search_month(year=year, month=month)
+        if bbox is None
+        else active_client.search_month(year=year, month=month, bbox=bbox)
+    )
     return SwissEODiscoveryResult(
         year=year,
         month=month,
-        items=active_client.search_month(year=year, month=month),
+        items=items,
         stac_url=active_client.stac_url,
         collection=active_client.collection,
     )

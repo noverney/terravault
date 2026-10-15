@@ -12,7 +12,9 @@ import pytest
 
 from terravault.vegetation import (
     VEGETATION_INDEX_NAMES,
+    bbox_envelope,
     locate_gdal,
+    pixel_window,
     run_gdal,
     write_vegetation_indices,
 )
@@ -189,3 +191,54 @@ def test_index_stack_preserves_values_order_descriptions_and_metadata(tmp_path: 
     assert info["metadata"][""]["TERRAVAULT_TEST"] == "preserved"
     assert info["metadata"]["IMAGE_STRUCTURE"]["INTERLEAVE"] == "BAND"
     assert info["metadata"]["IMAGE_STRUCTURE"]["LAYOUT"] == "COG"
+
+
+def test_pixel_window_snaps_outward_buffers_and_clips_to_the_raster():
+    metadata = {
+        "size": [100, 50],
+        "geoTransform": [1000.0, 10.0, 0.0, 2000.0, 0.0, -10.0],
+    }
+
+    assert pixel_window(metadata, (1015.0, 1801.0, 1041.0, 1979.0)) == (1, 2, 4, 18)
+    assert pixel_window(metadata, (1015.0, 1801.0, 1041.0, 1979.0), buffer_pixels=2) == (
+        0,
+        0,
+        7,
+        22,
+    )
+    # Clipped to the raster on the far side, and None when disjoint.
+    assert pixel_window(metadata, (1950.0, 1500.0, 2500.0, 1600.0)) == (95, 40, 5, 10)
+    assert pixel_window(metadata, (3000.0, 1500.0, 3100.0, 1600.0)) is None
+
+
+def test_pixel_window_rejects_rotated_rasters():
+    metadata = {"size": [10, 10], "geoTransform": [0.0, 10.0, 1.0, 0.0, 0.0, -10.0]}
+
+    with pytest.raises(ValueError, match="north-up"):
+        pixel_window(metadata, (0.0, -50.0, 50.0, 0.0))
+
+
+def test_bbox_envelope_samples_every_edge_and_takes_the_extremes(monkeypatch):
+    calls = []
+
+    def fake_run_gdal(arguments, *, stdin=None):
+        calls.append((list(arguments), stdin))
+        # A transform that bows the north edge upwards in its middle, which a
+        # corner-only transform would miss.
+        lines = []
+        for line in stdin.splitlines():
+            x, y = (float(value) for value in line.split())
+            bulge = 5.0 if y == 47.0 and 8.0 < x < 9.0 else 0.0
+            lines.append(f"{x * 100} {y * 100 + bulge}")
+        return subprocess.CompletedProcess(arguments, 0, "\n".join(lines) + "\n", "")
+
+    monkeypatch.setattr("terravault.vegetation.run_gdal", fake_run_gdal)
+
+    envelope = bbox_envelope("gdaltransform", (8.0, 46.0, 9.0, 47.0), "EPSG:2056")
+
+    assert envelope == (800.0, 4600.0, 900.0, 4705.0)
+    arguments, stdin = calls[0]
+    assert arguments == [
+        "gdaltransform", "-s_srs", "EPSG:4326", "-t_srs", "EPSG:2056", "-output_xy"
+    ]
+    assert len(stdin.splitlines()) == 4 * 21

@@ -35,8 +35,10 @@ from .vegetation import (
     REFLECTANCE_BAND_NAMES,
     VEGETATION_INDEX_DEFINITIONS,
     VEGETATION_INDEX_NAMES,
+    bbox_envelope,
     inspect_raster,
     locate_gdal,
+    pixel_window,
     raster_extent,
     run_gdal,
     set_vrt_band_descriptions,
@@ -64,6 +66,14 @@ _BAND_WORKERS = max(1, int(os.environ.get("TERRAVAULT_SWISSEO_BAND_WORKERS", "3"
 _DOWNLOAD_ATTEMPTS = max(1, int(os.environ.get("TERRAVAULT_SWISSEO_DOWNLOAD_ATTEMPTS", "5")))
 _DOWNLOAD_BACKOFF_SECONDS = 5.0
 _DOWNLOAD_TIMEOUT = (30, 180)
+
+# Every swissEO asset is a national COG of up to ~700 MB.  When the bbox needs
+# only a small part of one, read that window with HTTP range requests instead
+# of downloading the file: a 20 km patch is under 1% of the country.  Larger
+# windows keep the whole-file download, which is the robust path nationally.
+_WINDOWED_FETCH_MAX_FRACTION = 0.25
+# Source pixels kept around the bbox for the bilinear and max warps.
+_WINDOW_BUFFER_PIXELS = 8
 
 
 def _validate_bbox(bbox: Sequence[float]) -> tuple[float, float, float, float]:
@@ -291,8 +301,11 @@ class SwissEOMonthlyProcessor:
                 "gdalbuildvrt",
                 "gdalwarp",
                 "gdalinfo",
+                "gdaltransform",
             )
         )
+        self._envelopes: dict[str, tuple[float, float, float, float]] = {}
+        self._fetch_modes: set[str] = set()
 
     def _metadata_summary(self, metadata: Mapping[str, Any]) -> dict[str, Any]:
         if self.config.version.per_band_assets:
@@ -331,7 +344,42 @@ class SwissEOMonthlyProcessor:
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.partial")
         started = time.perf_counter()
-        if href.startswith(("https://", "http://")):
+        window = (
+            self._bbox_window(href) if href.startswith(("https://", "http://")) else None
+        )
+        if window is not None:
+            self._fetch_modes.add("bbox-window")
+            logger.info("reading swissEO window %s of %s -> %s", window, href, output.name)
+            for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+                try:
+                    run_gdal(
+                        (
+                            self._gdal["gdal_translate"],
+                            "-of",
+                            "GTiff",
+                            "-srcwin",
+                            *(str(value) for value in window),
+                            "-co",
+                            f"COMPRESS={self.config.compression}",
+                            "-co",
+                            "TILED=YES",
+                            f"/vsicurl/{href}",
+                            str(temporary),
+                        )
+                    )
+                    break
+                except RuntimeError as error:
+                    temporary.unlink(missing_ok=True)
+                    if attempt == _DOWNLOAD_ATTEMPTS:
+                        raise
+                    delay = _DOWNLOAD_BACKOFF_SECONDS * attempt
+                    logger.warning(
+                        "window read of %s failed (attempt %d/%d: %s); retrying in %.0fs",
+                        output.name, attempt, _DOWNLOAD_ATTEMPTS, error, delay,
+                    )
+                    time.sleep(delay)
+        elif href.startswith(("https://", "http://")):
+            self._fetch_modes.add("whole-file")
             logger.info("downloading swissEO asset %s -> %s", href, output.name)
             for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
                 try:
@@ -363,6 +411,31 @@ class SwissEOMonthlyProcessor:
             time.perf_counter() - started,
         )
         return output
+
+    def _bbox_window(self, href: str) -> tuple[int, int, int, int] | None:
+        """The pixel window of a remote asset worth fetching instead of the file.
+
+        Only the COG header is read here.  None means fetch the whole file:
+        the bbox covers a large part of it, or (unexpectedly) none of it.
+        """
+
+        metadata = inspect_raster(self._gdal["gdalinfo"], f"/vsicurl/{href}")
+        wkt = str((metadata.get("coordinateSystem") or {}).get("wkt") or "")
+        if not wkt:
+            return None
+        if wkt not in self._envelopes:
+            self._envelopes[wkt] = bbox_envelope(
+                self._gdal["gdaltransform"], self.config.bbox, wkt
+            )
+        window = pixel_window(
+            metadata, self._envelopes[wkt], buffer_pixels=_WINDOW_BUFFER_PIXELS
+        )
+        if window is None:
+            return None
+        width, height = (int(value) for value in metadata["size"])
+        if window[2] * window[3] > _WINDOWED_FETCH_MAX_FRACTION * width * height:
+            return None
+        return window
 
     def _readable_raster(self, path: Path, *, bands: int | None = None) -> bool:
         """Report whether a checkpointed raster survived an interrupted run.
@@ -735,6 +808,9 @@ class SwissEOMonthlyProcessor:
                 "public swissEO COG assets downloaded once to the local temporary "
                 "volume, warped to aligned national subsets, then removed"
             ),
+            # "bbox-window" reads only the pixels around a small bbox with HTTP
+            # range requests; "whole-file" downloads the national COG.
+            "asset_fetch_modes": sorted(self._fetch_modes),
             "timing_scope": {
                 "monthly_mosaic_generation": (
                     "remote COG reads, alignment, six band-specific masked orbit-mosaic "
@@ -795,6 +871,7 @@ class SwissEOMonthlyProcessor:
             year=self.config.year,
             month=self.config.month,
             client=self.client,
+            bbox=self.config.bbox,
         )
         if not discovery.items:
             raise FileNotFoundError("No swissEO orbit mosaics were published for this month")

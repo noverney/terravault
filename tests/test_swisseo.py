@@ -9,6 +9,7 @@ from terravault.swisseo import (
     SWISSEO_COLLECTION,
     SWISSEO_REFLECTANCE_SCALE,
     SWISSEO_STAC_URL,
+    SwissEOClient,
     SwissEOImageConfig,
     SwissEOImageProcessor,
     discover_swisseo_month,
@@ -137,3 +138,21 @@ def test_dry_run_is_one_swisseo_image_and_not_monthly_or_force(tmp_path: Path):
     assert manifest["attribution"] == (
         "© swisstopo, Contains modified Copernicus Sentinel data 2024"
     )
+
+
+def test_month_search_sends_the_bbox_only_when_one_is_given(monkeypatch):
+    client = SwissEOClient()
+    requests_made: list[dict] = []
+
+    def fake_json(url, *, params=None):
+        requests_made.append(dict(params or {}))
+        return {"features": [], "links": []}
+
+    monkeypatch.setattr(client, "_json", fake_json)
+
+    client.search_month(year=2024, month=7)
+    client.search_month(year=2024, month=7, bbox=(8.17, 46.975, 8.47, 47.155))
+
+    assert "bbox" not in requests_made[0]
+    assert requests_made[1]["bbox"] == "8.17,46.975,8.47,47.155"
+    assert requests_made[0]["datetime"] == requests_made[1]["datetime"]

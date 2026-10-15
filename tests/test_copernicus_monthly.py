@@ -513,3 +513,50 @@ def test_selection_accepts_assets_staged_locally_when_archive_is_offline(
     # A truncated staged copy is not usable and must not pass.
     staged.write_bytes(b"short")
     assert not processor._asset_available(piece)
+
+
+def test_scene_extent_cuts_a_tile_to_the_bbox_on_the_output_grid(monkeypatch, tmp_path: Path):
+    database_path = tmp_path / "dataset.duckdb"
+    database_path.write_bytes(b"catalog-placeholder")
+    monkeypatch.setattr("terravault.copernicus_monthly.DatasetCatalog", lambda path: object())
+    monkeypatch.setattr(
+        "terravault.copernicus_monthly.locate_gdal",
+        lambda *names: {name: name for name in names},
+    )
+    envelopes = []
+
+    def fake_envelope(_tool, bbox, srs):
+        envelopes.append((tuple(bbox), srs))
+        return (2_650_003.0, 1_200_007.0, 2_672_995.0, 1_219_991.0)
+
+    monkeypatch.setattr("terravault.copernicus_monthly.bbox_envelope", fake_envelope)
+    processor = CopernicusMonthlyProcessor(
+        CopernicusMonthlyConfig(
+            dataset_db=database_path,
+            output_root=tmp_path / "monthly",
+            year=2024,
+            month=7,
+            bbox=(8.17, 46.975, 8.47, 47.155),
+            resolution=10.0,
+        )
+    )
+    tile = (2_600_000.0, 1_150_000.0, 2_710_000.0, 1_260_000.0)
+
+    # Snapped outwards to the 10 m grid, then four pixels of margin.
+    assert processor._scene_extent(tile) == (
+        2_649_960.0,
+        1_199_960.0,
+        2_673_040.0,
+        1_220_040.0,
+    )
+    # Clipped to a tile that only covers part of the bbox.
+    assert processor._scene_extent((2_660_000.0, 1_150_000.0, 2_710_000.0, 1_210_000.0)) == (
+        2_660_000.0,
+        1_199_960.0,
+        2_673_040.0,
+        1_210_000.0,
+    )
+    # A tile that misses the bbox keeps its own extent.
+    outside = (2_700_000.0, 1_100_000.0, 2_800_000.0, 1_150_000.0)
+    assert processor._scene_extent(outside) == outside
+    assert envelopes == [((8.17, 46.975, 8.47, 47.155), "EPSG:2056")]

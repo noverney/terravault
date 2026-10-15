@@ -74,10 +74,14 @@ class FakeMonthlyClient:
             _item("2024-06-11t102031", "2024-06-11T10:20:31Z"),
         )
         self.search_calls: list[tuple[int, int]] = []
+        self.search_bboxes: list[Any] = []
         self.metadata_calls: list[str] = []
 
-    def search_month(self, *, year: int, month: int) -> tuple[dict[str, Any], ...]:
+    def search_month(
+        self, *, year: int, month: int, bbox=None
+    ) -> tuple[dict[str, Any], ...]:
         self.search_calls.append((year, month))
+        self.search_bboxes.append(bbox)
         return self.items
 
     def get_metadata(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -104,6 +108,7 @@ def test_swisseo_monthly_dry_run_uses_all_items_and_records_timings(tmp_path: Pa
     assert result.dry_run is True
     assert result.item_count == 2
     assert client.search_calls == [(2024, 6)]
+    assert client.search_bboxes == [(8.0, 46.0, 8.01, 46.01)], "orbits are filtered by bbox"
     assert client.metadata_calls == ["2024-06-04t101559", "2024-06-11t102031"]
     assert not result.reflectance_path.exists()
     assert not result.indices_path.exists()
@@ -380,7 +385,7 @@ def _build_local_month(tmp_path: Path):
         stac_url = SWISSEO_STAC_URL
         collection = SWISSEO_COLLECTION
 
-        def search_month(self, *, year: int, month: int):
+        def search_month(self, *, year: int, month: int, bbox=None):
             assert (year, month) == (2024, 6)
             return tuple(items)
 
@@ -630,7 +635,7 @@ def _build_local_v200_month(tmp_path: Path):
         stac_url = SWISSEO_STAC_URL
         collection = SWISSEO_V200_COLLECTION
 
-        def search_month(self, *, year: int, month: int):
+        def search_month(self, *, year: int, month: int, bbox=None):
             return tuple(items)
 
         def get_metadata(self, item: dict[str, Any]):
@@ -682,3 +687,106 @@ def test_v200_month_applies_offset_and_rejects_cloud_and_terrain_shadow(tmp_path
     assert means(result.indices_path) == pytest.approx(
         [0.25 / 0.35, 0.23 / 0.37, 0.24 / 0.40, 0.12 / 0.48], abs=5e-4
     )  # NDVI GNDVI NDRE NDWI
+
+
+def _windowing_processor(monkeypatch, tmp_path: Path, *, size, envelope):
+    processor = SwissEOMonthlyProcessor(
+        SwissEOMonthlyConfig(
+            output_root=tmp_path / "monthly",
+            year=2024,
+            month=7,
+            bbox=(8.17, 46.975, 8.47, 47.155),
+        ),
+        client=FakeMonthlyClient(),
+    )
+    metadata = {
+        "size": list(size),
+        "geoTransform": [2_480_000.0, 10.0, 0.0, 1_300_000.0, 0.0, -10.0],
+        "coordinateSystem": {"wkt": "LV95"},
+    }
+    inspected: list[str] = []
+    commands: list[list[str]] = []
+
+    def fake_inspect(_gdalinfo, path):
+        inspected.append(str(path))
+        return metadata
+
+    def fake_run_gdal(command, **_kwargs):
+        commands.append(list(command))
+        Path(command[-1]).write_bytes(b"window")
+
+    monkeypatch.setattr("terravault.swisseo_monthly.inspect_raster", fake_inspect)
+    monkeypatch.setattr(
+        "terravault.swisseo_monthly.bbox_envelope", lambda _tool, _bbox, _srs: envelope
+    )
+    monkeypatch.setattr("terravault.swisseo_monthly.run_gdal", fake_run_gdal)
+    return processor, inspected, commands
+
+
+def test_small_bbox_reads_a_window_of_the_remote_cog_instead_of_the_file(
+    monkeypatch, tmp_path: Path
+):
+    # A 23 x 20 km patch inside a 450 x 230 km national COG.
+    processor, inspected, commands = _windowing_processor(
+        monkeypatch,
+        tmp_path,
+        size=(45_000, 23_000),
+        envelope=(2_650_000.0, 1_200_000.0, 2_673_000.0, 1_220_000.0),
+    )
+
+    def no_download(*_args, **_kwargs):
+        raise AssertionError("the whole national file must not be downloaded")
+
+    monkeypatch.setattr("requests.get", no_download)
+    href = "https://data.geo.admin.ch/b04_10m.tif"
+    output = tmp_path / "item" / "source-b04_10m.tif"
+
+    assert processor._download_asset(href=href, output=output) == output
+
+    assert inspected == [f"/vsicurl/{href}"]
+    (command,) = commands
+    srcwin = command.index("-srcwin")
+    assert command[srcwin + 1 : srcwin + 5] == ["16992", "7992", "2316", "2016"]
+    assert command[-2] == f"/vsicurl/{href}"
+    assert output.read_bytes() == b"window"
+    assert not list(output.parent.glob(".*partial*"))
+    assert processor._fetch_modes == {"bbox-window"}
+
+
+def test_large_bbox_keeps_the_whole_file_download(monkeypatch, tmp_path: Path):
+    processor, _, commands = _windowing_processor(
+        monkeypatch,
+        tmp_path,
+        size=(45_000, 23_000),
+        envelope=(2_480_000.0, 1_070_000.0, 2_930_000.0, 1_300_000.0),
+    )
+
+    assert processor._bbox_window("https://data.geo.admin.ch/b04_10m.tif") is None
+    assert commands == []
+
+
+def test_failed_window_read_is_retried_from_scratch(monkeypatch, tmp_path: Path):
+    processor, _, _ = _windowing_processor(
+        monkeypatch,
+        tmp_path,
+        size=(45_000, 23_000),
+        envelope=(2_650_000.0, 1_200_000.0, 2_673_000.0, 1_220_000.0),
+    )
+    attempts: list[bool] = []
+
+    def flaky_run_gdal(command, **_kwargs):
+        # Record whether a previous attempt's partial file was still there.
+        attempts.append(Path(command[-1]).exists())
+        Path(command[-1]).write_bytes(b"truncated" if len(attempts) == 1 else b"window")
+        if len(attempts) == 1:
+            raise RuntimeError("GDAL command failed: HTTP 503")
+
+    monkeypatch.setattr("terravault.swisseo_monthly.run_gdal", flaky_run_gdal)
+    monkeypatch.setattr("terravault.swisseo_monthly.time.sleep", lambda _seconds: None)
+    output = tmp_path / "item" / "source-b04_10m.tif"
+
+    processor._download_asset(href="https://data.geo.admin.ch/b04_10m.tif", output=output)
+
+    assert attempts == [False, False], "a truncated partial file is removed before retrying"
+    assert output.read_bytes() == b"window"
+    assert not list(output.parent.glob(".*partial*"))

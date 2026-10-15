@@ -67,6 +67,57 @@ CDSE S3 credentials use `TERRAVAULT_CDSE_S3_ACCESS_KEY` and
 use a CDSE bearer token or account credentials from the existing
 `TERRAVAULT_CDSE_*` environment variables for the Product ZIP route.
 
+## Small patches
+
+FORCE always corrects a whole Sentinel-2 granule, so a patch still costs one
+full L2PS run per acquisition. What a patch can save is everything around that
+run. Measured on a 23 × 20 km patch around Lucerne (8.17–8.47° E,
+46.975–47.155° N), July 2024, on an Apple M2 Max (12 cores) with Docker Desktop
+limited to 23.4 GiB:
+
+1. **Discover by the patch.** `--bbox`/`--roi` set to the patch selects only the
+   granules that cover it. Keep the patch inside one MGRS tile's exclusive area
+   (away from the ~10 km tile overlaps) and every acquisition is one SAFE: 12
+   L1C products (8.6 GB, 6 min 15 s) for the month.
+2. **Pass `--max-cloud-cover 100`** when comparing cloud masks. The catalogue
+   estimate is granule-wide: only 2 of the 12 July 2024 acquisitions were under
+   20%, but the per-pixel QAI decides what is usable inside the patch.
+3. **Use a DEM** (`--dem`). Without one FORCE skips topographic correction and
+   its cloud-shadow matching is weaker, which matters in the Alps. A Copernicus
+   GLO-30 mosaic warped to Int16 LV95 with nodata `-32767` works.
+4. **Clip with `--force-aoi` set to the patch buffered by ~5 km**, not
+   `--clip-to-roi`. The buffer keeps FORCE's AOI edge effect outside the patch.
+   Per scene this took 164 s instead of 205 s, wrote 168 MB instead of
+   1.69 GB and 4 instead of 23 FORCE tiles. Inside the patch BOA differed from
+   the unclipped run by at most 12 DN (0.0012 reflectance; more than 10 DN in
+   0.0001% of pixels) and QAI was identical for 99.999% of pixels.
+5. **Leave `--scene-workers` at 1 with all threads on this hardware.** One scene
+   took 164 s at 12 threads, 206 s at 6 and 269 s at 4. Two workers at 6
+   threads each slowed one another to 282 s per scene, 155 s of wall time per
+   scene against 164–170 s for one worker — a 7% gain, and one of the 12 scenes
+   failed with a FORCE "Error creating file" in its output tile under that
+   load. It succeeded on `--retry-failed` alone. Each concurrent scene peaked at
+   about 6.4 GiB of container memory.
+
+The complete patch run:
+
+```bash
+terravault force-pipeline \
+  --bbox 8.17 46.975 8.47 47.155 \
+  --start-date 2024-07-01 --end-date 2024-07-31 \
+  --max-cloud-cover 100 \
+  --output-root ~/terravault-patch/lucerne/force-native \
+  --runtime docker \
+  --dem ~/terravault-patch/lucerne/reference/dem_t32tmt_glo30_lv95.tif \
+  --force-aoi ~/terravault-patch/lucerne/roi/lucerne-patch-aoi-5km.geojson \
+  --scene-workers 1 --threads 12 \
+  --mount-root ~/terravault-patch/lucerne
+```
+
+`terravault monthly --bbox` then windows each acquisition to the patch before
+screening it; see
+[the monthly composites guide](SWITZERLAND_MONTHLY_COMPOSITES.md#small-patches).
+
 ## Python API
 
 The convenience function exposes the arguments normally changed between runs:

@@ -206,6 +206,54 @@ required attribution:
 © swisstopo, Contains modified Copernicus Sentinel data [Year]
 ```
 
+## Small patches
+
+All three routes accept `--bbox` (or `--roi`) and do work proportional to it,
+not to the source granules or national mosaics:
+
+- **Post-FORCE (`monthly`)** cuts each acquisition's BOA/QAI mosaic to the bbox
+  on the native FORCE grid before screening, so values are unchanged, and
+  screens the acquisitions in parallel (`TERRAVAULT_FORCE_MONTHLY_SCENE_WORKERS`,
+  default 6). Acquisitions that miss the bbox are skipped and listed under
+  `scenes_outside_bbox` in the manifest.
+- **Copernicus (`copernicus-monthly`)** warps each scene only over the part of
+  its tile that the bbox needs, snapped to the output grid.
+- **swissEO (`swisseo-monthly`)** keeps only the orbit mosaics whose footprint
+  meets the bbox, and when the bbox needs at most a quarter of an asset it
+  reads that window from the public COG with HTTP range requests instead of
+  downloading the national file (up to ~690 MB per band, ~3 GB per v200
+  orbit). The manifest's `asset_fetch_modes` records which path ran.
+
+Measured on the 23 × 20 km Lucerne patch (July 2024, 10 m, 12 acquisitions,
+Apple M2 Max), with FORCE products clipped to the patch plus 5 km:
+
+| Post-FORCE monthly | Before | After |
+|---|---:|---:|
+| QAI screening | 410 s | 26 s |
+| Monthly median | 286 s | 47 s |
+| Total | 706 s | 82 s |
+| Peak temporary storage | 2.7 GiB | 1.4 GiB |
+
+Before, every acquisition was screened serially over all four 30 km FORCE
+tiles it covered and the median ran over their union; after, both run on the
+2302 × 2028 patch window.
+
+The reflectance and index COGs from both versions are identical except for
+float rounding below 1e-7 in a handful of pixels.
+
+On the same patch, `copernicus-monthly` took 96 s for 12 scenes, and
+`swisseo-monthly` took 159 s for the 12 v200 orbits over the patch and 65 s
+for the 9 v100 orbits, reading only windows (no whole-file downloads, under
+1 GiB of temporary storage). Before the bbox filter and windowed reads the same
+commands would have fetched every orbit of the month in full: 22 v200 orbits
+at ~2.9 GB and 16 v100 orbits at ~3.3 GB each, roughly 63 GB and 53 GB (from
+the 29 July 2024 asset sizes).
+
+swissEO keeps its checkpoints under `--temporary-root/checkpoints/<stem>`, and
+the stem names the month, version and resolution but not the bbox. Give a
+patch run its own `--temporary-root` so it can never resume from a national
+run's checkpoints, or the reverse.
+
 ## Four shared equations
 
 After each route has standardized its input to physical reflectance in B03,

@@ -153,10 +153,15 @@ def test_scene_reflectance_command_uses_force_boa_and_qai(monkeypatch, tmp_path)
         )
     )
     commands: list[list[str]] = []
-    monkeypatch.setattr(processor, "_validate_scene", lambda _scene: None)
+    monkeypatch.setattr(processor, "_validate_scene", lambda _scene: {})
+    monkeypatch.setattr(
+        processor,
+        "_windowed_sources",
+        lambda scene, _boa, _directory: (scene.boa_path, scene.qai_path),
+    )
     monkeypatch.setattr("terravault.monthly.run_gdal", lambda command: commands.append(list(command)))
 
-    processor._scene_reflectance(scene, tmp_path / "scene.tif")
+    assert processor._scene_reflectance(scene, tmp_path / "scene.tif") is True
 
     command = commands[0]
     assert str(scene.boa_path) in command
@@ -164,3 +169,80 @@ def test_scene_reflectance_command_uses_force_boa_and_qai(monkeypatch, tmp_path)
     calculations = [command[index + 1] for index, value in enumerate(command) if value == "--calc"]
     assert all("bitwise_and(Q,799)==0" in expression for expression in calculations)
     assert any("A*0.0001" in expression for expression in calculations)
+
+
+def _boa_metadata() -> dict:
+    # One FORCE granule mosaic: 11,000 x 11,000 pixels at 10 m in LV95.
+    return {
+        "size": [11_000, 11_000],
+        "geoTransform": [2_600_000.0, 10.0, 0.0, 1_260_000.0, 0.0, -10.0],
+        "coordinateSystem": {"wkt": "LV95"},
+    }
+
+
+def _windowing_processor(monkeypatch, tmp_path, envelope):
+    database_path = _force_database(tmp_path)
+    scene = discover_force_month(year=2024, month=6, force_db=database_path).scenes[0]
+    processor = MonthlyCompositeProcessor(
+        MonthlyCompositeConfig(
+            force_db=database_path,
+            output_root=tmp_path / "monthly",
+            year=2024,
+            month=6,
+            bbox=(8.17, 46.975, 8.47, 47.155),
+        )
+    )
+    envelopes: list[tuple] = []
+
+    def fake_envelope(_gdaltransform, bbox, srs):
+        envelopes.append((tuple(bbox), srs))
+        return envelope
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr("terravault.monthly.bbox_envelope", fake_envelope)
+    monkeypatch.setattr("terravault.monthly.run_gdal", lambda command: commands.append(list(command)))
+    return processor, scene, commands, envelopes
+
+
+def test_windowed_sources_cut_boa_and_qai_to_the_bbox_on_the_native_grid(
+    monkeypatch, tmp_path
+):
+    processor, scene, commands, envelopes = _windowing_processor(
+        monkeypatch, tmp_path, (2_650_005.0, 1_200_000.0, 2_673_000.0, 1_220_000.0)
+    )
+
+    boa, qai = processor._windowed_sources(scene, _boa_metadata(), tmp_path / "scene")
+
+    assert (boa, qai) == (tmp_path / "scene" / "boa.vrt", tmp_path / "scene" / "qai.vrt")
+    # 5000.5 px from the left edge floors to 5000, minus the 4-pixel buffer.
+    window = ["-srcwin", "4996", "3996", "2308", "2008"]
+    assert commands == [
+        [processor._gdal["gdal_translate"], "-of", "VRT", *window, str(scene.boa_path), str(boa)],
+        [processor._gdal["gdal_translate"], "-of", "VRT", *window, str(scene.qai_path), str(qai)],
+    ]
+    # The envelope is computed once per CRS, not once per scene.
+    processor._windowed_sources(scene, _boa_metadata(), tmp_path / "again")
+    assert envelopes == [((8.17, 46.975, 8.47, 47.155), "LV95")]
+
+
+def test_windowed_sources_keep_the_original_when_the_bbox_covers_the_scene(
+    monkeypatch, tmp_path
+):
+    processor, scene, commands, _ = _windowing_processor(
+        monkeypatch, tmp_path, (2_500_000.0, 1_100_000.0, 2_800_000.0, 1_300_000.0)
+    )
+
+    sources = processor._windowed_sources(scene, _boa_metadata(), tmp_path / "scene")
+
+    assert sources == (scene.boa_path, scene.qai_path)
+    assert commands == []
+
+
+def test_scene_outside_the_bbox_is_skipped_without_screening(monkeypatch, tmp_path):
+    processor, scene, commands, _ = _windowing_processor(
+        monkeypatch, tmp_path, (2_800_000.0, 1_100_000.0, 2_810_000.0, 1_110_000.0)
+    )
+    monkeypatch.setattr(processor, "_validate_scene", lambda _scene: _boa_metadata())
+
+    assert processor._scene_reflectance(scene, tmp_path / "scene.tif") is False
+    assert commands == []

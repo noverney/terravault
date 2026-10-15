@@ -31,6 +31,7 @@ from .vegetation import (
     REFLECTANCE_BAND_NAMES,
     VEGETATION_INDEX_DEFINITIONS,
     VEGETATION_INDEX_NAMES,
+    bbox_envelope,
     inspect_raster,
     locate_gdal,
     raster_extent,
@@ -76,6 +77,9 @@ _UNRESOLVED = object()
 
 _VARIABLES = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 _FLOAT32_BYTES = 4
+# Output pixels kept around the bbox so the final bilinear clip has
+# neighbours at the patch edge.
+_WINDOW_BUFFER_PIXELS = 4
 
 
 def _iso_z(value: datetime) -> str:
@@ -252,9 +256,15 @@ class CopernicusMonthlyProcessor:
             {}
             if config.dry_run
             else locate_gdal(
-                "gdal_calc.py", "gdal_translate", "gdalwarp", "gdalbuildvrt", "gdalinfo"
+                "gdal_calc.py",
+                "gdal_translate",
+                "gdalwarp",
+                "gdalbuildvrt",
+                "gdalinfo",
+                "gdaltransform",
             )
         )
+        self._bbox_extent: tuple[float, float, float, float] | None = None
 
     def _query(self) -> tuple[dict[str, list[CopernicusMonthlyScene]], dict[str, tuple[str, ...]]]:
         start, end = calendar_month_window(self.config.year, self.config.month)
@@ -305,6 +315,40 @@ class CopernicusMonthlyProcessor:
             command.extend(("-te", *(str(value) for value in extent)))
         command.extend((str(piece["local_path"]), str(output)))
         run_gdal(command)
+
+    def _scene_extent(
+        self, tile_extent: tuple[float, float, float, float]
+    ) -> tuple[float, float, float, float]:
+        """The part of one tile's target-grid extent that the bbox needs.
+
+        A Sentinel-2 tile is about 110 km across, so screening it whole for a
+        patch a few kilometres wide does nearly all of its work for nothing.
+        The bbox envelope is snapped outwards to the -tap grid, so the window
+        keeps the tile's pixel alignment.  A tile that misses the bbox keeps its
+        full extent rather than producing an empty raster.
+        """
+
+        if self._bbox_extent is None:
+            resolution = self.config.resolution
+            buffer = _WINDOW_BUFFER_PIXELS * resolution
+            min_x, min_y, max_x, max_y = bbox_envelope(
+                self._gdal["gdaltransform"], self.config.bbox, self.config.target_crs
+            )
+            self._bbox_extent = (
+                math.floor(min_x / resolution) * resolution - buffer,
+                math.floor(min_y / resolution) * resolution - buffer,
+                math.ceil(max_x / resolution) * resolution + buffer,
+                math.ceil(max_y / resolution) * resolution + buffer,
+            )
+        window = (
+            max(tile_extent[0], self._bbox_extent[0]),
+            max(tile_extent[1], self._bbox_extent[1]),
+            min(tile_extent[2], self._bbox_extent[2]),
+            min(tile_extent[3], self._bbox_extent[3]),
+        )
+        if window[0] >= window[2] or window[1] >= window[3]:
+            return tile_extent
+        return window
 
     @staticmethod
     def _physical_transform(piece: Mapping[str, Any]) -> tuple[float, float]:
@@ -514,7 +558,17 @@ class CopernicusMonthlyProcessor:
                 resampling="near" if key in COPERNICUS_QUALITY_ASSETS else "bilinear",
             )
             if common_extent is None:
-                common_extent = raster_extent(inspect_raster(self._gdal["gdalinfo"], output))
+                tile_extent = raster_extent(inspect_raster(self._gdal["gdalinfo"], output))
+                common_extent = self._scene_extent(tile_extent)
+                if common_extent != tile_extent:
+                    # Warped VRTs are lazy, so re-warping the first band to the
+                    # window costs nothing but one more gdalwarp call.
+                    self._warp_asset(
+                        piece=staged_piece,
+                        output=output,
+                        extent=common_extent,
+                        resampling="near" if key in COPERNICUS_QUALITY_ASSETS else "bilinear",
+                    )
             warped[key] = output
 
         variables = dict(

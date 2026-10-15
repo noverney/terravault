@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -89,7 +90,9 @@ GDAL_CACHE_MIB = os.environ.get("TERRAVAULT_GDAL_CACHE_MIB", "512")
 GDAL_WRITE_THREADS = os.environ.get("TERRAVAULT_GDAL_THREADS", "2")
 
 
-def run_gdal(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+def run_gdal(
+    arguments: Sequence[str], *, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
     """Run one GDAL command without leaking credentials into the log."""
 
     logger.debug("Running GDAL command: %s", " ".join(arguments))
@@ -111,6 +114,7 @@ def run_gdal(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         env=environment,
+        input=stdin,
     )
     stdout = _bounded_gdal_diagnostic(completed.stdout)
     stderr = _bounded_gdal_diagnostic(completed.stderr)
@@ -153,6 +157,75 @@ def raster_extent(metadata: Mapping[str, Any]) -> tuple[float, float, float, flo
     x1 = x0 + width * pixel_width
     y1 = y0 + height * pixel_height
     return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+
+
+def bbox_envelope(
+    gdaltransform: str,
+    bbox_wgs84: Sequence[float],
+    target_srs: str,
+    *,
+    samples_per_edge: int = 21,
+) -> tuple[float, float, float, float]:
+    """Envelope of a WGS84 bbox in another CRS.
+
+    Transforming only the corners under-covers a reprojected box whose edges
+    bow outwards, so every edge is sampled before taking the envelope.
+    """
+
+    west, south, east, north = (float(value) for value in bbox_wgs84)
+    steps = [index / (samples_per_edge - 1) for index in range(samples_per_edge)]
+    points = [
+        *((west + (east - west) * step, south) for step in steps),
+        *((east, south + (north - south) * step) for step in steps),
+        *((east - (east - west) * step, north) for step in steps),
+        *((west, north - (north - south) * step) for step in steps),
+    ]
+    # gdaltransform reads and writes longitude/latitude order for EPSG:4326.
+    completed = run_gdal(
+        (gdaltransform, "-s_srs", "EPSG:4326", "-t_srs", target_srs, "-output_xy"),
+        stdin="".join(f"{x!r} {y!r}\n" for x, y in points),
+    )
+    coordinates = [
+        tuple(float(value) for value in line.split()[:2])
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    ]
+    if len(coordinates) != len(points):
+        raise RuntimeError(f"gdaltransform returned {len(coordinates)} of {len(points)} points")
+    xs = [x for x, _ in coordinates]
+    ys = [y for _, y in coordinates]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def pixel_window(
+    metadata: Mapping[str, Any],
+    envelope: Sequence[float],
+    *,
+    buffer_pixels: int = 0,
+) -> tuple[int, int, int, int] | None:
+    """Pixel window ``(xoff, yoff, xsize, ysize)`` of a raster covering an envelope.
+
+    The envelope must be in the raster's CRS.  The window is widened to whole
+    pixels plus ``buffer_pixels`` on every side, then clipped to the raster, so
+    reading it needs no resampling.  Returns None when they do not overlap.
+    """
+
+    width, height = (int(value) for value in metadata["size"])
+    x0, pixel_width, x_skew, y0, y_skew, pixel_height = (
+        float(value) for value in metadata["geoTransform"]
+    )
+    if abs(x_skew) > 1e-9 or abs(y_skew) > 1e-9 or pixel_width <= 0 or pixel_height >= 0:
+        raise ValueError("Only north-up rasters can be windowed")
+    min_x, min_y, max_x, max_y = (float(value) for value in envelope)
+    left = math.floor((min_x - x0) / pixel_width) - buffer_pixels
+    right = math.ceil((max_x - x0) / pixel_width) + buffer_pixels
+    top = math.floor((max_y - y0) / pixel_height) - buffer_pixels
+    bottom = math.ceil((min_y - y0) / pixel_height) + buffer_pixels
+    left, top = max(left, 0), max(top, 0)
+    right, bottom = min(right, width), min(bottom, height)
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right - left, bottom - top
 
 
 def set_vrt_band_descriptions(vrt_path: Path, names: Sequence[str]) -> None:

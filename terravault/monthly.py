@@ -15,6 +15,7 @@ import os
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,8 +28,10 @@ from .vegetation import (
     REFLECTANCE_BAND_NAMES,
     VEGETATION_INDEX_DEFINITIONS,
     VEGETATION_INDEX_NAMES,
+    bbox_envelope,
     inspect_raster,
     locate_gdal,
+    pixel_window,
     run_gdal,
     set_vrt_band_descriptions,
     write_described_cog,
@@ -44,6 +47,12 @@ FORCE_BOA_NODATA = -9999
 DEFAULT_FORCE_QAI_MASK = 0x031F
 _FLOAT32_BYTES = 4
 _VARIABLES = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+# Source pixels kept around the bbox so the final bilinear, target-aligned
+# warp has neighbours at the patch edge.
+_WINDOW_BUFFER_PIXELS = 4
+# Each scene is screened by its own gdal_calc process, and one scene used to
+# wait for the previous one: 12 windowed July 2024 scenes took 128 s serially.
+_SCENE_WORKERS = max(1, int(os.environ.get("TERRAVAULT_FORCE_MONTHLY_SCENE_WORKERS", "6")))
 
 # Native FORCE Level-2 BOA order.  The selected Sentinel-2 meanings are kept
 # explicit so BROADNIR (B08) can never be confused with NIR (B8A).
@@ -330,8 +339,11 @@ class MonthlyCompositeProcessor:
                 "gdalbuildvrt",
                 "gdalwarp",
                 "gdalinfo",
+                "gdaltransform",
             )
         )
+        self._envelopes: dict[str, tuple[float, float, float, float]] = {}
+        self._outside_bbox: list[str] = []
 
     @staticmethod
     def _band_domain(band: Mapping[str, Any]) -> str:
@@ -339,7 +351,7 @@ class MonthlyCompositeProcessor:
         force = metadata.get("FORCE") or metadata.get("force") or {}
         return str(force.get("Domain") or force.get("DOMAIN") or "").upper()
 
-    def _validate_scene(self, scene: ForceMonthlyScene) -> None:
+    def _validate_scene(self, scene: ForceMonthlyScene) -> dict[str, Any]:
         boa = inspect_raster(self._gdal["gdalinfo"], scene.boa_path)
         qai = inspect_raster(self._gdal["gdalinfo"], scene.qai_path)
         boa_bands = boa.get("bands") or []
@@ -358,9 +370,61 @@ class MonthlyCompositeProcessor:
             raise ValueError(f"FORCE BOA/QAI sizes differ for {scene.item_id}")
         if boa.get("geoTransform") != qai.get("geoTransform"):
             raise ValueError(f"FORCE BOA/QAI grids differ for {scene.item_id}")
+        return boa
 
-    def _scene_reflectance(self, scene: ForceMonthlyScene, output: Path) -> None:
-        self._validate_scene(scene)
+    def _windowed_sources(
+        self, scene: ForceMonthlyScene, boa: Mapping[str, Any], directory: Path
+    ) -> tuple[Path, Path] | None:
+        """Cut the BOA/QAI pair down to the bbox before any pixel is read.
+
+        A FORCE acquisition covers a whole Sentinel-2 granule, so screening it
+        unclipped writes and medians about 110 x 110 km per scene even for a
+        patch a few kilometres wide.  The window is taken on the native FORCE
+        grid, so values are unchanged.  Returns None when the scene misses the
+        bbox entirely.
+        """
+
+        wkt = str((boa.get("coordinateSystem") or {}).get("wkt") or "")
+        if not wkt:
+            raise ValueError(f"FORCE BOA has no coordinate system: {scene.boa_path}")
+        if wkt not in self._envelopes:
+            self._envelopes[wkt] = bbox_envelope(
+                self._gdal["gdaltransform"], self.config.bbox, wkt
+            )
+        window = pixel_window(
+            boa, self._envelopes[wkt], buffer_pixels=_WINDOW_BUFFER_PIXELS
+        )
+        if window is None:
+            return None
+        width, height = (int(value) for value in boa["size"])
+        if window == (0, 0, width, height):
+            return scene.boa_path, scene.qai_path
+        directory.mkdir(parents=True, exist_ok=True)
+        windowed: list[Path] = []
+        for source, name in ((scene.boa_path, "boa.vrt"), (scene.qai_path, "qai.vrt")):
+            output = directory / name
+            run_gdal(
+                (
+                    self._gdal["gdal_translate"],
+                    "-of",
+                    "VRT",
+                    "-srcwin",
+                    *(str(value) for value in window),
+                    str(source),
+                    str(output),
+                )
+            )
+            windowed.append(output)
+        return windowed[0], windowed[1]
+
+    def _scene_reflectance(self, scene: ForceMonthlyScene, output: Path) -> bool:
+        """Write one QAI-screened scene; False when it does not reach the bbox."""
+
+        boa = self._validate_scene(scene)
+        sources = self._windowed_sources(scene, boa, output.with_suffix(""))
+        if sources is None:
+            return False
+        boa_path, qai_path = sources
         command = [self._gdal["gdal_calc.py"]]
         variables: dict[str, str] = {}
         for band_name, variable in zip(
@@ -369,9 +433,9 @@ class MonthlyCompositeProcessor:
             variables[band_name] = variable
             band_number = FORCE_REFLECTANCE_BAND_MAP[band_name][1]
             command.extend(
-                (f"-{variable}", str(scene.boa_path), f"--{variable}_band", str(band_number))
+                (f"-{variable}", str(boa_path), f"--{variable}_band", str(band_number))
             )
-        command.extend(("-Q", str(scene.qai_path), "--Q_band", "1"))
+        command.extend(("-Q", str(qai_path), "--Q_band", "1"))
         valid_qai = f"bitwise_and(Q,{self.config.qai_mask})==0"
         for band_name in MONTHLY_BAND_NAMES:
             variable = variables[band_name]
@@ -405,6 +469,7 @@ class MonthlyCompositeProcessor:
             )
         )
         run_gdal(command)
+        return True
 
     def _monthly_median(self, inputs: Sequence[Path], output: Path) -> None:
         command = [self._gdal["gdal_calc.py"]]
@@ -570,6 +635,7 @@ class MonthlyCompositeProcessor:
             "estimated_uncompressed_bytes": estimated_bytes,
             "dry_run": self.config.dry_run,
             "scene_count": len(discovery.scenes),
+            "scenes_outside_bbox": list(self._outside_bbox),
             "average_catalog_cloud_cover_pct": (
                 None if not cloud_values else sum(cloud_values) / len(cloud_values)
             ),
@@ -743,18 +809,31 @@ class MonthlyCompositeProcessor:
                 dir=output_directory,
             ) as temporary:
                 temporary_path = Path(temporary)
-                scene_outputs: list[Path] = []
                 stage = time.perf_counter()
-                for number, scene in enumerate(discovery.scenes, start=1):
+
+                def screen(numbered: tuple[int, ForceMonthlyScene]) -> Path | None:
+                    number, scene = numbered
                     output = temporary_path / f"scene-{number:04d}.tif"
                     logger.info(
                         "Screening native FORCE BOA – item=%s acquisition=%s",
                         scene.item_id,
                         _iso_z(scene.acquisition_time),
                     )
-                    self._scene_reflectance(scene, output)
-                    scene_outputs.append(output)
+                    return output if self._scene_reflectance(scene, output) else None
+
+                with ThreadPoolExecutor(max_workers=_SCENE_WORKERS) as pool:
+                    screened = list(pool.map(screen, enumerate(discovery.scenes, start=1)))
+                scene_outputs = [output for output in screened if output is not None]
+                for scene, output in zip(discovery.scenes, screened, strict=True):
+                    if output is None:
+                        logger.info("Skipping %s: it does not overlap the bbox", scene.item_id)
+                        self._outside_bbox.append(scene.item_id)
                 timings["force_qai_screening"] = time.perf_counter() - stage
+                if not scene_outputs:
+                    raise FileNotFoundError(
+                        "No completed native FORCE acquisition overlaps the bbox for "
+                        f"{self.config.year:04d}-{self.config.month:02d}"
+                    )
 
                 stage = time.perf_counter()
                 median = temporary_path / "force-monthly-median.tif"
