@@ -98,6 +98,11 @@ limited to 23.4 GiB:
    failed with a FORCE "Error creating file" in its output tile under that
    load. It succeeded on `--retry-failed` alone. Each concurrent scene peaked at
    about 6.4 GiB of container memory.
+6. **Leave the other L2PS settings at their defaults.** `--parallel-reads`,
+   `--no-force-overview` and keeping FORCE's files off the bind mount gave the
+   same products and no speed-up beyond run-to-run noise. The only faster
+   resolution merge, `NONE`, saves about 6% and changes the products; see
+   [L2PS settings on one scene](#l2ps-settings-on-one-scene).
 
 The complete patch run:
 
@@ -117,6 +122,69 @@ terravault force-pipeline \
 `terravault monthly --bbox` then windows each acquisition to the patch before
 screening it; see
 [the monthly composites guide](SWITZERLAND_MONTHLY_COMPOSITES.md#small-patches).
+
+### L2PS settings on one scene
+
+Measured on 16 October 2026 with the scene, DEM and 5 km cutline of item 4
+(S2A, 19 July 2024, T32TMT), `--threads 12`, one run at a time on an otherwise
+idle machine. Seconds are `force-level2` wall time, with FORCE's own processing
+time in brackets; MB is `du` of `level2`. Products are compared with the
+default run inside the patch after warping each mosaic to EPSG:2056 at 10 m
+(nearest). BOA columns count all 10 bands of every pixel.
+
+| Variant | Seconds | MB | BOA identical | BOA max \|Δ\| (DN) | BOA > 10 DN | QAI identical |
+|---|---|---:|---:|---:|---:|---:|
+| Default (`IMPROPHE`, overview, serial reads), 3 runs | 167, 160, 159 (163, 157, 155) | 168.0 | 100% | 0 | 0% | 100% |
+| `--no-force-overview`, 2 runs | 161, 166 (158, 163) | 167.9 | 100% | 0 | 0% | 100% |
+| `--parallel-reads`, 2 runs | 157, 166 (154, 163) | 168.0 | 100% | 0 | 0% | 100% |
+| `--parallel-reads --no-force-overview` | 158 (155) | 167.9 | 100% | 0 | 0% | 100% |
+| Default, SAFE and all FORCE output on a container tmpfs¹ | (154) | 167.9 | 100% | 0 | 0% | 100% |
+| `--resolution-merge NONE`, 2 runs² | 158, 148 (154, 145) | 168.7 | 14.7% | 10,512 | 41.6% | 99.81% |
+| `--resolution-merge STARFM` | 219 (216) | 167.9 | 9.1% | 12,340 | 46.1% | 99.88% |
+| `--resolution-merge REGRESSION` | 327 (323) | 166.7 | 12.3% | 15,454 | 45.7% | 99.88% |
+
+¹ A hand-run `docker run` of the default parameter file with `DIR_LEVEL2`,
+`DIR_TEMP`, `DIR_LOG`, `DIR_PROVENANCE`, the queue and a copy of the SAFE on a
+tmpfs inside the container; the wrapper was not changed. Copying the 693 MB
+SAFE in took 0.7 s and the 168 MB of output out 0.3 s.
+² The second run also had `--parallel-reads --no-force-overview`.
+
+**Speed only.** `--no-force-overview`, `--parallel-reads` and the tmpfs run
+gave bit-identical BOA and QAI and stayed inside the default's 159–167 s range
+(164 s on 15 October), so none of them helps. The overview is four quicklook
+JPEGs (32 kB). Docker Desktop file sharing is not the bottleneck: FORCE kept
+about 9 of the 12 cores busy on average (830–1020% in `docker stats` samples).
+The rest is a ~30 s phase on exactly two cores and a few single-core steps,
+which looked the same with parallel reads and on tmpfs, so it is FORCE's own
+serial work.
+
+**Resolution merge changes the products.** `NONE` saves about 9 s per scene
+(6%). `STARFM` costs 35% more, mostly a minute on one core, and `REGRESSION`
+twice the time. Every choice changes all ten bands, not only the six 20 m ones:
+
+- 20 m bands (B05–B07, B8A, B11, B12): mean |Δ| 26–84 DN and 99th percentile
+  180–470 DN (0.018–0.047 reflectance); 52–76% of pixels differ by more than
+  10 DN.
+- 10 m bands: B02–B04 mean |Δ| 2–4 DN (99th percentile 20–38 DN), B08
+  13–16 DN (130–160 DN). QAI's water-vapour bit changes for about 0.1% of
+  pixels, so the merged B8A probably reaches the 10 m bands through FORCE's
+  per-pixel water-vapour estimate.
+- There is almost no bias: the mean signed difference is under 4 DN in every
+  band. On clear pixels NDRE and NDWI shift by at most ±0.002 on average but
+  by 0.012–0.015 mean |Δ| and 0.08–0.10 at the 99th percentile per pixel.
+  TerraVault's NDRE (B8A, B05), NDWI (B08, B11) and B05/B8A/B11 composite bands
+  therefore depend on the setting; NDVI and GNDVI depend on it only through the
+  small 10 m changes.
+- QAI cloud, shadow and snow bits are identical. Only the subzero (8),
+  saturation (9) and water-vapour (14) bits change. Under the monthly default
+  mask `0x031F`, which includes bits 8 and 9, 0.04–0.08% of patch pixels
+  switch between usable and masked.
+
+These numbers measure how far the merges differ from each other, not which is
+more accurate. Keep the default `IMPROPHE`, overview on and serial reads; at
+about 160 s per scene this is as fast as these settings make L2PS on this Mac.
+`NONE` is not worth 6% for a product that reports NDRE and NDWI, and choose
+`STARFM` or `REGRESSION` only for scientific reasons.
 
 ## Python API
 
